@@ -1,7 +1,10 @@
 import pandas
 
-from equipment_recommender_rag.embeddings.create_embeddings import create_embedding_openai
+from equipment_recommender_rag.embeddings.create_embeddings import (
+    create_embedding_openai,
+)
 from equipment_recommender_rag.utils.highlighted_output import print_highlight
+
 
 # Takes in dataframe and columns that need to be embedded
 # Creates extra columns with COLUMN_NAME_embeddings and return full df
@@ -26,6 +29,6 @@ def store_embedded_file(
 
     print_highlight("Embedding succesful")
 
-    df_embedded.to_csv(output_path, index= False)
+    df_embedded.to_csv(output_path, index=False)
 
     print_highlight(f"Results stored in '{output_path}'")

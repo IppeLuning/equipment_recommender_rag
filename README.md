@@ -8,11 +8,21 @@ Repo for my Thesis Project regarding an AI system that recommends equipment depe
 
 We make use of `uv` for handling dependencies, virtual environments etc.. Addiotionally, this improves reproducibilty. 
 
+Run the code using `uv run python main.py`
+
 ## Initial setup (baseline)
 
 Two things we need for the baseline:
 - Dense Retrieval / semantic search
 - Retrieval Augmented Generation (RAG)
+
+## Formatting
+
+We use Ruff for formatting. Important commands:
+
+- `uv run ruff format .` This formats your code automatically (making indents, puts long code on new lines etc.)
+- `uv run ruff check .`  Finds issues that are not solveable with formatting, similar to ESlint
+- `uv run ruff check . --fix` Tries to fix these issues by itself
 
 ## Usage of models
 
