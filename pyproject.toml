@@ -22,3 +22,14 @@ build-backend = "uv_build"
 
 [tool.uv]
 package = false
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]  # errors, formatting, imports
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"

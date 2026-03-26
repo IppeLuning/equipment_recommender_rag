@@ -1,4 +1,6 @@
 import os
+import pandas
+
 import httpx
 from dotenv import load_dotenv
 
