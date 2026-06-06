@@ -1,0 +1,91 @@
+[
+  {
+    "pdf_path": "data/single_files/Prominent_radiative_contributions_from_multiply-excited_states_in_laser-produced_tin_plasma_for_nanolithography.pdf",
+    "is_review_paper": false,
+    "benchmark_items": [
+      {
+        "query_id": "sn_euv_spectra_01",
+        "problem_description": "We need to measure the EUV emission spectrum from a laser-produced tin microdroplet plasma and compare it against calculated opacity spectra around 13.5 nm. What instrument should we use?",
+        "difficulty": "easy",
+        "case_type": "local_match",
+        "literature_ideal_equipment": [
+          "transmission grating spectrometer"
+        ],
+        "best_match": [
+          "transmission grating spectrometer"
+        ],
+        "acceptable_alternatives": [
+          "wavelength-calibrated spectrometer",
+          "spectrometer"
+        ],
+        "supporting_but_not_ideal": [],
+        "not_available_locally": [],
+        "clearly_not_suitable": [
+          "Nd:YAG laser system"
+        ],
+        "rationale": "The paper explicitly states that the EUV spectrum was recorded with a transmission grating spectrometer / wavelength-calibrated spectrometer. A laser is needed for plasma generation, not for spectral measurement.",
+        "evidence_text": [
+          "A transmission grating spectrometer, set up under a −60° angle with respect to the laser light propagation direction, enables unraveling the EUV spectrum.",
+          "The emission in the EUV regime is recorded using a wavelength-calibrated spectrometer"
+        ]
+      },
+      {
+        "query_id": "sn_plasma_generation_02",
+        "problem_description": "We are trying to generate a tin microdroplet plasma for EUV lithography studies using a pulsed solid-state drive laser rather than a CO2 laser. Which laser system best matches the setup in this paper?",
+        "difficulty": "medium",
+        "case_type": "multiple_local_options",
+        "literature_ideal_equipment": [
+          "Nd:YAG laser system"
+        ],
+        "best_match": [
+          "Nd:YAG laser system"
+        ],
+        "acceptable_alternatives": [
+          "high-energy Nd:YAG laser system",
+          "Nd:YAG laser"
+        ],
+        "supporting_but_not_ideal": [],
+        "not_available_locally": [],
+        "clearly_not_suitable": [
+          "transmission grating spectrometer"
+        ],
+        "rationale": "The paper uses a 15-ns Nd:YAG pulse to irradiate molten tin microdroplets and generate the EUV-emitting plasma. Several local variants of the same laser platform would be reasonable matches.",
+        "evidence_text": [
+          "The experimental spectra were obtained by irradiating a molten Sn microdroplet, 30 μm in diameter, with a 15-ns-long Nd:YAG laser pulse",
+          "Switching to 1-μm-wavelength Nd:YAG lasers, for example, would be beneficial"
+        ]
+      },
+      {
+        "query_id": "sn_radiation_transport_03",
+        "problem_description": "I want to model where most of the EUV emission is formed in a dense tin microdroplet plasma and relate the spectra to plasma density and temperature. What kind of simulation framework or code should I use?",
+        "difficulty": "hard",
+        "case_type": "literature_ideal_unavailable",
+        "literature_ideal_equipment": [
+          "RALEF-2D code"
+        ],
+        "best_match": [],
+        "acceptable_alternatives": [
+          "radiation-hydrodynamics simulation code",
+          "radiative transfer code"
+        ],
+        "supporting_but_not_ideal": [
+          "ATOMIC",
+          "CHEMEOS"
+        ],
+        "not_available_locally": [
+          "RALEF-2D code"
+        ],
+        "clearly_not_suitable": [
+          "transmission grating spectrometer",
+          "Nd:YAG laser system"
+        ],
+        "rationale": "The paper uses RALEF-2D for radiation-hydrodynamics simulations to determine temperature and density profiles and the EUV-emissive zone. In a local lab, an exact RALEF-2D setup is unlikely to be available, so more general radiation-hydrodynamics or radiative transfer codes are the practical alternatives.",
+        "evidence_text": [
+          "We have undertaken radiation hydrodynamic simulations using the RALEF-2D code",
+          "RALEF-2D is a two-dimensional numerical code which solves the 2D single-fluid, one-temperature hydrodynamics equations and the spectral radiation transfer equation"
+        ]
+      }
+    ],
+    "status": "benchmark_items_extracted"
+  }
+]

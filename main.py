@@ -1,23 +1,26 @@
-from equipment_recommender_rag.embeddings.embed_file import store_embedded_file
-from equipment_recommender_rag.retrieval.dense_retrieval import dense_retrieval_query
 
-CREATE_EMBEDDING = False
-RETRIEVE_TOP_K = True
+import argparse
+from equipment_recommender_rag import main_pipeline
+import pandas as pd
 
-if __name__ == "__main__":
-    if CREATE_EMBEDDING:
-        store_embedded_file(
-            file_path="data/raw/equipment_database_sample.csv",
-            columns_embeddings=[
-                "Short description (2-3 sentences)",
-                "Typical applications (3+ bullets)",
-            ],
-            output_path="data/processed/equipment_database_sample_output.csv",
-        )
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input_file", type=str, help="path to input file")
+    parser.add_argument("--output_file", type=str, help="path to output file")
+#    parser.add_argument("--task_name", type=str, default="default", help="default indicates multi paper QA tasks. If you want to test models on SciFact, PubmedQA or QASA, change the task names accordingly.")
+#    parser.add_argument("--dataset", type=str, default=None, help="specify the HF data path if you load them from HF datasets.")
 
-    if RETRIEVE_TOP_K:
-        dense_retrieval_query(
-            query="What instrument scans a sample with a focused electron beam to generate signals that reveal surface topography and composition?",
-            embedding_database_path="data/processed/equipment_database_sample_output.csv",
-            column_name="Short description (2-3 sentences)",
-        )
+    args = parser.parse_args()
+
+    input_file = args.input_file
+    output_file = args.output_file
+
+    df = pd.read_csv(input_file)
+
+    for index, row in df.iterrows():
+        print(f"Query {index}")
+        response = main_pipeline.run(query = row["problem_description"])
+
+
+if __name__ == '__main__':
+    main()
