@@ -1,18 +1,13 @@
 import os
-import pandas
-
 import httpx
 from dotenv import load_dotenv
 
-# Put .env in environment
 load_dotenv()
 
-API_KEY = os.getenv("OPENAI_KEY")
+API_KEY = os.getenv("OPENAI_API_KEY")
 
 
 def create_embedding_openai(text: str) -> list[float]:
-    print(text)
-
     response = httpx.post(
         "https://api.openai.com/v1/embeddings",
         headers={
@@ -23,10 +18,9 @@ def create_embedding_openai(text: str) -> list[float]:
             "input": text,
             "model": "text-embedding-3-small",
         },
+        timeout=60.0,
     )
 
-    # Throws error if HTTP error occurs
     response.raise_for_status()
     data = response.json()
-
     return data["data"][0]["embedding"]
