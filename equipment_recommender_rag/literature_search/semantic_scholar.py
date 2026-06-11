@@ -346,7 +346,7 @@ def search_papers_for_question(
     max_queries: int = 4,
     max_paper_num_per_query: int = 10,
     model: str = "gpt-5.4-mini",
-    min_seconds_between_queries: float = 2,
+    min_seconds_between_queries: float = 10.0,
 ) -> dict[str, Any]:
     """
     Full literature-search step:
