@@ -13,7 +13,7 @@ from equipment_recommender_rag.literature_search.semantic_scholar_cache import (
 
 load_dotenv()
 
-S2_API_KEY = os.environ["S2_API_KEY"]
+S2_API_KEY = os.environ["S2_API_KEY"].strip()
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -54,17 +54,7 @@ Important rules:
 - Avoid overly generic standalone queries such as "phase separation analysis", "morphological analysis", or "SEM microstructure".
 - Prefer specific literature-search phrases over full sentences.
 
-Examples:
-##
-Question: How have prior work incorporated personality attributes to train personalized dialogue generation models?
-Search queries: personalized dialogue generation, personalized language models, personalized dialogue
-##
-Question: How do retrieval-augmented LMs perform well in knowledge-intensive tasks?
-Search queries: retrieval-augmented LMs, knowledge-intensive tasks, large language models for knowledge-intensive tasks, retrieval-augmented generation
-##
-Question: Our experimental medical-grade PEEK variant is much softer than expected. We suspect morphology or phase separation may be involved. Which equipment could help analyze this?
-Search queries: PEEK morphology phase separation mechanical softness, medical grade PEEK nanoscale morphology mechanical properties, PEEK structure property relationships morphology, semicrystalline polymer phase separation stiffness characterization
-##
+
 Question: {question}
 Search queries:
 """
@@ -237,8 +227,8 @@ def search_paper_via_query(
     if "Search queries:" in query:
         query = query.split("Search queries:", 1)[1].strip()
 
-    min_citation_count = 10
-    sort = "citationCount:desc"
+    min_citation_count = 0
+    sort = ""
     fields = SEMANTIC_SCHOLAR_FIELDS
 
     if use_cache:
@@ -258,9 +248,11 @@ def search_paper_via_query(
         "query": query,
         "limit": max_paper_num,
         "minCitationCount": min_citation_count,
-        "sort": sort,
         "fields": fields,
     }
+
+    print("Calling Semantic Scholar query:", query)
+    print("Using S2 key:", S2_API_KEY[:6] + "..." + S2_API_KEY[-4:])
 
     headers = {"x-api-key": S2_API_KEY}
 
@@ -274,7 +266,7 @@ def search_paper_via_query(
     if response.status_code == 200:
         response_data = response.json()
         if response_data is None or "data" not in response_data:
-            print(f"retrieval failed for query: {query}")
+            print(f"retrieval failed for query as no papers showed up: {query}")
             return None
 
         papers = response_data["data"]
@@ -292,6 +284,11 @@ def search_paper_via_query(
         return papers
 
     if response.status_code == 429:
+        print("S2 status:", response.status_code)
+        print("S2 headers:", dict(response.headers))
+        print("S2 body:", response.text)
+        print("retry after:", response.headers.get("Retry-After"))
+
         retry_after = response.headers.get("Retry-After")
         if retry_after is not None:
             try:

@@ -35,6 +35,7 @@ def retrieve_candidate_chunks_from_papers(
     min_chunk_sz: int = 80,
     keep_last: bool = True,
     use_metadata_fallback: bool = True,
+    abstract_only: bool = False,
 ) -> pd.DataFrame:
     """
     Convert Semantic Scholar paper results into candidate evidence chunks.
@@ -64,43 +65,51 @@ def retrieve_candidate_chunks_from_papers(
         print("DOI:", doi)
         print("URL:", url)
 
-        full_text_result = retrieve_full_text(
-            doi=doi,
-            arxiv_id=None,
-            url=url,
-        )
-
-        print("  retrieval status:", full_text_result["status"])
-        print("  source type:", full_text_result["source_type"])
-        print("  source url:", full_text_result["source_url"])
-
-        if full_text_result["status"] == "success" and full_text_result["full_text"]:
-            source_text = full_text_result["full_text"]
-            source_type = full_text_result["source_type"]
-            source_url = full_text_result["source_url"]
-
-        elif use_metadata_fallback:
+        if abstract_only:
             fallback_text = paper_metadata_text(paper)
 
             if not fallback_text:
-                print("  skipping paper: no full text and no usable metadata")
+                print("  skipping paper: no usable abstract/metadata")
                 continue
 
-            source_type = paper_fallback_source_type(paper)
-
-            if source_type == "abstract":
-                print("  using abstract fallback")
-            elif source_type == "tldr_metadata":
-                print("  using TLDR/metadata fallback")
-            else:
-                print("  using title/metadata fallback")
-
             source_text = fallback_text
+            source_type = paper_fallback_source_type(paper)
             source_url = url
 
+            print(f"  using Semantic Scholar fallback source: {source_type}")
+
         else:
-            print("  skipping paper: no usable full text")
-            continue
+            full_text_result = retrieve_full_text(
+                doi=doi,
+                arxiv_id=None,
+                url=url,
+            )
+
+            print("  retrieval status:", full_text_result["status"])
+            print("  source type:", full_text_result["source_type"])
+            print("  source url:", full_text_result["source_url"])
+
+            if full_text_result["status"] == "success" and full_text_result["full_text"]:
+                source_text = full_text_result["full_text"]
+                source_type = full_text_result["source_type"]
+                source_url = full_text_result["source_url"]
+
+            elif use_metadata_fallback:
+                fallback_text = paper_metadata_text(paper)
+
+                if not fallback_text:
+                    print("  skipping paper: no full text and no usable metadata")
+                    continue
+
+                source_text = fallback_text
+                source_type = paper_fallback_source_type(paper)
+                source_url = url
+
+                print(f"  using Semantic Scholar fallback source: {source_type}")
+
+            else:
+                print("  skipping paper: no usable full text")
+                continue
 
         top_chunks = retrieve_top_k_chunks_from_full_text(
             query=query,
