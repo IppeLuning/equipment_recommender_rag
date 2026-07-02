@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
 import re
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +19,197 @@ from equipment_recommender_rag.problem_decomposition.subproblem_generation impor
 
 
 DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.json")
+
+
+COMPLETED_STATUS = "completed"
+FAILED_STATUS = "failed"
+INTERRUPTED_STATUS = "interrupted"
+
+
+def utc_now_iso() -> str:
+    """
+    Return an ISO timestamp in UTC for run bookkeeping.
+    """
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _is_missing_scalar(value: Any) -> bool:
+    """
+    Treat None and pandas/numpy missing scalar values as missing.
+    """
+    if value is None:
+        return True
+
+    try:
+        missing = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+
+    try:
+        return bool(missing)
+    except (TypeError, ValueError):
+        return False
+
+
+def _optional_text(value: Any) -> str | None:
+    """
+    Convert a scalar value to clean text, returning None for missing/empty values.
+    """
+    if _is_missing_scalar(value):
+        return None
+
+    text = str(value).strip()
+    return text or None
+
+
+def make_query_run_id(query_record: dict[str, Any]) -> str:
+    """
+    Create a stable ID for resume/checkpointing.
+
+    If query_id exists, that is preferred. Otherwise a hash of the query and source
+    metadata is used. This makes reruns skip exactly the same benchmark item, even
+    when the input file is processed again from the beginning.
+    """
+    query_id = _optional_text(query_record.get("query_id"))
+    if query_id:
+        return f"query_id:{query_id}"
+
+    identity_payload = {
+        "query": _optional_text(query_record.get("query")) or "",
+        "source_pdf_path": _optional_text(query_record.get("source_pdf_path")),
+        "source_doi": _optional_text(query_record.get("source_doi")),
+    }
+    identity_text = json.dumps(
+        identity_payload,
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+    digest = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:16]
+    return f"sha256:{digest}"
+
+
+def add_input_metadata(record: dict[str, Any], query_record: dict[str, Any]) -> None:
+    """
+    Add the original benchmark/input fields to a result or failure record.
+    """
+    record["input_run_id"] = make_query_run_id(query_record)
+    record["input_query_id"] = query_record.get("query_id")
+    record["input_source_pdf_path"] = query_record.get("source_pdf_path")
+    record["input_source_doi"] = query_record.get("source_doi")
+    record["input_source_is_review_paper"] = query_record.get("source_is_review_paper")
+    record["input_raw_benchmark_item"] = query_record.get("raw_benchmark_item", {})
+
+
+def record_run_id(record: dict[str, Any]) -> str | None:
+    """
+    Recover a run ID from a current or older output record.
+    """
+    run_id = _optional_text(record.get("input_run_id"))
+    if run_id:
+        return run_id
+
+    original_query = _optional_text(record.get("original_query"))
+    if not original_query:
+        return None
+
+    query_record = {
+        "query": original_query,
+        "query_id": record.get("input_query_id"),
+        "source_pdf_path": record.get("input_source_pdf_path"),
+        "source_doi": record.get("input_source_doi"),
+    }
+    return make_query_run_id(query_record)
+
+
+def record_status(record: dict[str, Any]) -> str:
+    """
+    Return the status of a record, with backwards compatibility for old outputs.
+    """
+    status = _optional_text(record.get("run_status"))
+    if status:
+        return status
+
+    if record.get("error"):
+        return FAILED_STATUS
+
+    return COMPLETED_STATUS
+
+
+def load_existing_records(output_path: str | Path) -> list[dict[str, Any]]:
+    """
+    Load previous output records so the run can resume instead of starting over.
+    """
+    output_path = Path(output_path)
+
+    if not output_path.exists():
+        return []
+
+    if output_path.stat().st_size == 0:
+        return []
+
+    try:
+        if output_path.suffix.lower() == ".jsonl":
+            records: list[dict[str, Any]] = []
+            with output_path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    data = json.loads(line)
+                    if isinstance(data, dict):
+                        records.append(data)
+            return records
+
+        with output_path.open("r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        if isinstance(data, list):
+            return [record for record in data if isinstance(record, dict)]
+
+        if isinstance(data, dict):
+            return [data]
+
+    except (json.JSONDecodeError, OSError) as exc:
+        print(
+            f"Warning: could not load existing output file {output_path}: {exc}. "
+            "Starting with an empty in-memory record list."
+        )
+
+    return []
+
+
+def make_failure_record(
+    query_record: dict[str, Any],
+    exc: BaseException,
+    started_at_utc: str,
+    status: str = FAILED_STATUS,
+) -> dict[str, Any]:
+    """
+    Store enough information to inspect and optionally retry a failed query later.
+    """
+    failed_at_utc = utc_now_iso()
+    record: dict[str, Any] = {
+        "run_timestamp_utc": failed_at_utc,
+        "run_status": status,
+        "started_at_utc": started_at_utc,
+        "failed_at_utc": failed_at_utc,
+        "original_query": query_record.get("query"),
+        "decomposition": None,
+        "used_decomposition": None,
+        "num_subproblems_run": 0,
+        "subproblem_results": [],
+        "aggregated_equipment": [],
+        "error": {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "traceback": "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            ),
+        },
+    }
+    add_input_metadata(record, query_record)
+    return record
 
 RELEVANCE_SCORE = {
     "best_match": 3,
@@ -354,22 +547,26 @@ def save_json_records(records: list[dict[str, Any]], output_path: str | Path) ->
     """
     Save all full run records to a readable JSON file by default.
 
-    If the output path ends with .jsonl, it will still write line-delimited JSON
-    for backwards compatibility. Otherwise it writes a pretty-printed JSON array,
-    which is easier to inspect manually.
+    The file is written atomically via a temporary file and then replaced. This
+    reduces the chance of corrupting the existing checkpoint if the process is
+    interrupted while saving.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_name(f".{output_path.name}.tmp")
 
     if output_path.suffix.lower() == ".jsonl":
-        with output_path.open("w", encoding="utf-8") as file:
+        with tmp_path.open("w", encoding="utf-8") as file:
             for record in records:
-                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+                file.write(
+                    json.dumps(record, ensure_ascii=False, default=str) + "\n"
+                )
     else:
-        with output_path.open("w", encoding="utf-8") as file:
-            json.dump(records, file, indent=2, ensure_ascii=False)
+        with tmp_path.open("w", encoding="utf-8") as file:
+            json.dump(records, file, indent=2, ensure_ascii=False, default=str)
             file.write("\n")
 
+    tmp_path.replace(output_path)
     return output_path
 
 
@@ -643,6 +840,27 @@ def main() -> None:
         default=None,
         help="Optional CSV output with flattened aggregated equipment rows.",
     )
+    parser.add_argument(
+        "--no_resume",
+        action="store_true",
+        help="Ignore existing output_file contents and start a fresh run.",
+    )
+    parser.add_argument(
+        "--skip_failed",
+        action="store_true",
+        help=(
+            "When resuming, skip records that previously failed or were interrupted. "
+            "By default, completed records are skipped and failed records are retried."
+        ),
+    )
+    parser.add_argument(
+        "--stop_on_error",
+        action="store_true",
+        help=(
+            "Stop the whole run after saving a failure record. By default, the script "
+            "logs the failure and continues with the next query."
+        ),
+    )
 
     parser.add_argument("--max_subproblems", type=int, default=5)
     parser.add_argument("--max_queries", type=int, default=4)
@@ -714,49 +932,153 @@ def main() -> None:
     if args.input_file:
         query_records.extend(load_query_records_from_input_file(args.input_file))
 
-    full_records: list[dict[str, Any]] = []
+    if args.no_resume:
+        full_records: list[dict[str, Any]] = []
+        print("Resume disabled: starting with an empty output record list.")
+    else:
+        full_records = load_existing_records(args.output_file)
+        if full_records:
+            completed_count = sum(
+                1 for record in full_records if record_status(record) == COMPLETED_STATUS
+            )
+            failed_count = sum(
+                1 for record in full_records if record_status(record) == FAILED_STATUS
+            )
+            interrupted_count = sum(
+                1 for record in full_records if record_status(record) == INTERRUPTED_STATUS
+            )
+            print(
+                f"Loaded {len(full_records)} existing output records from {args.output_file} "
+                f"({completed_count} completed, {failed_count} failed, "
+                f"{interrupted_count} interrupted)."
+            )
+
+    completed_run_ids = {
+        run_id
+        for record in full_records
+        if record_status(record) == COMPLETED_STATUS
+        for run_id in [record_run_id(record)]
+        if run_id
+    }
+    failed_or_interrupted_run_ids = {
+        run_id
+        for record in full_records
+        if record_status(record) in {FAILED_STATUS, INTERRUPTED_STATUS}
+        for run_id in [record_run_id(record)]
+        if run_id
+    }
+
     flat_rows: list[dict[str, Any]] = []
+    for existing_record in full_records:
+        if record_status(existing_record) == COMPLETED_STATUS:
+            flat_rows.extend(_record_to_flat_rows(existing_record))
+
+    skipped_completed = 0
+    skipped_failed = 0
 
     for query_index, query_record in enumerate(query_records, start=1):
         query = query_record["query"]
+        run_id = make_query_run_id(query_record)
+
+        if run_id in completed_run_ids:
+            skipped_completed += 1
+            print("\n" + "-" * 100)
+            print(f"Skipping already completed query {query_index}/{len(query_records)}")
+            if query_record.get("query_id"):
+                print("Query ID:", query_record.get("query_id"))
+            if query_record.get("source_pdf_path"):
+                print("Source PDF:", query_record.get("source_pdf_path"))
+            print("Run ID:", run_id)
+            print("-" * 100)
+            continue
+
+        if args.skip_failed and run_id in failed_or_interrupted_run_ids:
+            skipped_failed += 1
+            print("\n" + "-" * 100)
+            print(f"Skipping previously failed/interrupted query {query_index}/{len(query_records)}")
+            if query_record.get("query_id"):
+                print("Query ID:", query_record.get("query_id"))
+            if query_record.get("source_pdf_path"):
+                print("Source PDF:", query_record.get("source_pdf_path"))
+            print("Run ID:", run_id)
+            print("-" * 100)
+            continue
 
         print("\n" + "#" * 100)
         print(f"Running original query {query_index}/{len(query_records)}")
         if query_record.get("query_id"):
             print("Query ID:", query_record.get("query_id"))
+        if query_record.get("source_pdf_path"):
+            print("Source PDF:", query_record.get("source_pdf_path"))
+        print("Run ID:", run_id)
         print(query)
         print("#" * 100)
 
-        record = run_decomposed_pipeline(
-            query=query,
-            use_decomposition=not args.no_decomposition,
-            max_subproblems=args.max_subproblems,
-            max_queries=args.max_queries,
-            max_paper_num_per_query=args.max_paper_num_per_query,
-            max_papers=args.max_papers,
-            top_k_per_paper=args.top_k_per_paper,
-            final_top_n_chunks=args.final_top_n_chunks,
-            chunk_sz=args.chunk_sz,
-            min_chunk_sz=args.min_chunk_sz,
-            use_metadata_fallback=not args.no_metadata_fallback,
-            abstract_only=args.abstract_only,
-            save_subproblem_results=args.save_subproblem_results,
-            include_paper_retrieval_records=args.include_paper_retrieval_records,
-            retrieval_verbose=args.retrieval_verbose,
-            print_debug_tables=args.print_debug_tables,
-        )
+        started_at_utc = utc_now_iso()
 
-        record["input_query_id"] = query_record.get("query_id")
-        record["input_source_pdf_path"] = query_record.get("source_pdf_path")
-        record["input_source_doi"] = query_record.get("source_doi")
-        record["input_source_is_review_paper"] = query_record.get("source_is_review_paper")
-        record["input_raw_benchmark_item"] = query_record.get("raw_benchmark_item", {})
+        try:
+            record = run_decomposed_pipeline(
+                query=query,
+                use_decomposition=not args.no_decomposition,
+                max_subproblems=args.max_subproblems,
+                max_queries=args.max_queries,
+                max_paper_num_per_query=args.max_paper_num_per_query,
+                max_papers=args.max_papers,
+                top_k_per_paper=args.top_k_per_paper,
+                final_top_n_chunks=args.final_top_n_chunks,
+                chunk_sz=args.chunk_sz,
+                min_chunk_sz=args.min_chunk_sz,
+                use_metadata_fallback=not args.no_metadata_fallback,
+                abstract_only=args.abstract_only,
+                save_subproblem_results=args.save_subproblem_results,
+                include_paper_retrieval_records=args.include_paper_retrieval_records,
+                retrieval_verbose=args.retrieval_verbose,
+                print_debug_tables=args.print_debug_tables,
+            )
 
-        full_records.append(record)
-        flat_rows.extend(_record_to_flat_rows(record))
+            record["run_status"] = COMPLETED_STATUS
+            record["started_at_utc"] = started_at_utc
+            record["completed_at_utc"] = utc_now_iso()
+            add_input_metadata(record, query_record)
 
-        saved_path = save_json_records(full_records, args.output_file)
-        print(f"\nSaved JSON output to: {saved_path}")
+            full_records.append(record)
+            completed_run_ids.add(run_id)
+            flat_rows.extend(_record_to_flat_rows(record))
+
+            saved_path = save_json_records(full_records, args.output_file)
+            print(f"\nSaved checkpoint JSON output to: {saved_path}")
+
+        except KeyboardInterrupt as exc:
+            failure_record = make_failure_record(
+                query_record=query_record,
+                exc=exc,
+                started_at_utc=started_at_utc,
+                status=INTERRUPTED_STATUS,
+            )
+            full_records.append(failure_record)
+            failed_or_interrupted_run_ids.add(run_id)
+            saved_path = save_json_records(full_records, args.output_file)
+            print(f"\nInterrupted. Saved checkpoint JSON output to: {saved_path}")
+            raise
+
+        except Exception as exc:
+            failure_record = make_failure_record(
+                query_record=query_record,
+                exc=exc,
+                started_at_utc=started_at_utc,
+                status=FAILED_STATUS,
+            )
+            full_records.append(failure_record)
+            failed_or_interrupted_run_ids.add(run_id)
+            saved_path = save_json_records(full_records, args.output_file)
+            print(f"\nQuery failed but progress was saved to: {saved_path}")
+            print(f"Error type: {type(exc).__name__}")
+            print(f"Error message: {exc}")
+
+            if args.stop_on_error:
+                raise
+
+            print("Continuing with the next query...")
 
     if args.csv_output_file:
         csv_path = Path(args.csv_output_file)
@@ -764,9 +1086,31 @@ def main() -> None:
         pd.DataFrame(flat_rows).to_csv(csv_path, index=False)
         print(f"Saved flattened CSV output to: {csv_path}")
 
-    if len(full_records) == 1:
-        print("\nFinal aggregated equipment result:")
-        print(json.dumps(full_records[0]["aggregated_equipment"], indent=2, ensure_ascii=False))
+    print("\nRun summary:")
+    print(f"  Completed records in output: {len(completed_run_ids)}")
+    print(f"  Failed/interrupted records in output: {len(failed_or_interrupted_run_ids)}")
+    print(f"  Skipped already completed this run: {skipped_completed}")
+    print(f"  Skipped failed/interrupted this run: {skipped_failed}")
+
+    if len(query_records) == 1:
+        requested_run_id = make_query_run_id(query_records[0])
+        matching_completed_records = [
+            record
+            for record in full_records
+            if record_status(record) == COMPLETED_STATUS
+            and record_run_id(record) == requested_run_id
+        ]
+
+        if matching_completed_records:
+            print("\nFinal aggregated equipment result:")
+            print(
+                json.dumps(
+                    matching_completed_records[-1]["aggregated_equipment"],
+                    indent=2,
+                    ensure_ascii=False,
+                    default=str,
+                )
+            )
 
 
 if __name__ == "__main__":

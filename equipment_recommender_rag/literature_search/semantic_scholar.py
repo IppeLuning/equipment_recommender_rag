@@ -1,5 +1,8 @@
 import os
+import random
 import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import requests
@@ -19,6 +22,14 @@ OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
+
+SEMANTIC_SCHOLAR_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+DEFAULT_S2_REQUEST_SPACING_SECONDS = 1.1
+DEFAULT_S2_INITIAL_BACKOFF_SECONDS = 1.0
+DEFAULT_S2_MAX_BACKOFF_SECONDS = 16.0
+DEFAULT_S2_MAX_RETRIES = 4
+DEFAULT_S2_JITTER_SECONDS = 0.25
+
 
 # Keep this as a constant so the cache key is stable and easy to reuse.
 # These fields support richer fallback when an abstract or full text is unavailable.
@@ -243,11 +254,135 @@ def paper_fallback_source_type(paper: dict[str, Any]) -> str:
     return "metadata"
 
 
+
+def _parse_retry_after_seconds(retry_after: str | None) -> float | None:
+    """
+    Parse a Retry-After header.
+
+    Retry-After can be either:
+    - a number of seconds, e.g. "3"
+    - an HTTP-date
+
+    Returns None if the header is missing or cannot be parsed.
+    """
+    if not retry_after:
+        return None
+
+    retry_after = retry_after.strip()
+
+    try:
+        wait_seconds = float(retry_after)
+        return max(0.0, wait_seconds)
+    except ValueError:
+        pass
+
+    try:
+        retry_datetime = parsedate_to_datetime(retry_after)
+        if retry_datetime.tzinfo is None:
+            retry_datetime = retry_datetime.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        return max(0.0, (retry_datetime - now).total_seconds())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def _calculate_backoff_seconds(
+    attempt: int,
+    response: requests.Response | None = None,
+    initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
+    max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
+    jitter_seconds: float = DEFAULT_S2_JITTER_SECONDS,
+) -> float:
+    """
+    Calculate capped exponential backoff.
+
+    attempt is 0 for the first retry wait, 1 for the second, etc.
+
+    If Semantic Scholar returns Retry-After, use it as a lower bound when possible,
+    but never wait longer than max_backoff_seconds.
+    """
+    exponential_wait = initial_backoff_seconds * (2 ** attempt)
+
+    retry_after_wait = None
+    if response is not None:
+        retry_after_wait = _parse_retry_after_seconds(response.headers.get("Retry-After"))
+
+    wait_time = exponential_wait
+    if retry_after_wait is not None:
+        wait_time = max(wait_time, retry_after_wait)
+
+    if jitter_seconds > 0:
+        wait_time += random.uniform(0, jitter_seconds)
+
+    return min(wait_time, max_backoff_seconds)
+
+
+def _get_with_exponential_backoff(
+    url: str,
+    params: dict[str, Any],
+    headers: dict[str, str],
+    timeout: int = 30,
+    max_retries: int = DEFAULT_S2_MAX_RETRIES,
+    initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
+    max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
+    jitter_seconds: float = DEFAULT_S2_JITTER_SECONDS,
+) -> requests.Response:
+    """
+    GET request with capped exponential backoff for temporary failures.
+
+    Retries:
+    - 429 Too Many Requests
+    - 5xx temporary/server errors
+
+    Does not retry permanent client errors such as 400 or 403.
+    """
+    last_response: requests.Response | None = None
+
+    for attempt in range(max_retries + 1):
+        response = requests.get(
+            url,
+            params=params,
+            headers=headers,
+            timeout=timeout,
+        )
+        last_response = response
+
+        if response.status_code not in SEMANTIC_SCHOLAR_RETRYABLE_STATUS_CODES:
+            return response
+
+        if attempt >= max_retries:
+            return response
+
+        wait_time = _calculate_backoff_seconds(
+            attempt=attempt,
+            response=response,
+            initial_backoff_seconds=initial_backoff_seconds,
+            max_backoff_seconds=max_backoff_seconds,
+            jitter_seconds=jitter_seconds,
+        )
+
+        retry_after = response.headers.get("Retry-After")
+        retry_after_text = f", Retry-After={retry_after}" if retry_after else ""
+
+        print(
+            f"Semantic Scholar returned {response.status_code}{retry_after_text}. "
+            f"Retry {attempt + 1}/{max_retries} in {wait_time:.1f}s."
+        )
+
+        time.sleep(wait_time)
+
+    assert last_response is not None
+    return last_response
+
+
 def search_paper_via_query(
     query: str,
     max_paper_num: int = 10,
-    min_seconds_between_requests: float = 1.2,
     use_cache: bool = True,
+    max_retries: int = DEFAULT_S2_MAX_RETRIES,
+    initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
+    max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
 ) -> list[dict[str, Any]] | None:
     """
     Search Semantic Scholar for papers using a single query string.
@@ -255,6 +390,12 @@ def search_paper_via_query(
     Uses a local SQLite cache:
     - if the query has already been searched, return the cached response
     - otherwise call the Semantic Scholar API and save the result
+
+    Retry behavior:
+    - 429 and temporary 5xx errors use capped exponential backoff
+    - the maximum wait between retries is max_backoff_seconds, default 16s
+    - successful responses are cached
+    - failed/rate-limited responses are not cached
     """
     if "Search queries:" in query:
         query = query.split("Search queries:", 1)[1].strip()
@@ -288,11 +429,14 @@ def search_paper_via_query(
 
     headers = {"x-api-key": S2_API_KEY}
 
-    response = requests.get(
-        SEMANTIC_SCHOLAR_SEARCH_URL,
+    response = _get_with_exponential_backoff(
+        url=SEMANTIC_SCHOLAR_SEARCH_URL,
         params=query_params,
         headers=headers,
         timeout=30,
+        max_retries=max_retries,
+        initial_backoff_seconds=initial_backoff_seconds,
+        max_backoff_seconds=max_backoff_seconds,
     )
 
     if response.status_code == 200:
@@ -316,66 +460,23 @@ def search_paper_via_query(
         return papers
 
     if response.status_code == 429:
-        print("S2 status:", response.status_code)
-        print("S2 headers:", dict(response.headers))
-        print("S2 body:", response.text)
-        print("retry after:", response.headers.get("Retry-After"))
-
-        retry_after = response.headers.get("Retry-After")
-        if retry_after is not None:
-            try:
-                wait_time = float(retry_after)
-            except ValueError:
-                wait_time = min_seconds_between_requests
-        else:
-            wait_time = min_seconds_between_requests
-
-        print(f"Rate limited on query '{query}'. Retrying once in {wait_time:.1f}s.")
-        time.sleep(wait_time)
-
-        retry_response = requests.get(
-            SEMANTIC_SCHOLAR_SEARCH_URL,
-            params=query_params,
-            headers=headers,
-            timeout=30,
-        )
-
-        if retry_response.status_code == 200:
-            response_data = retry_response.json()
-            if response_data is None or "data" not in response_data:
-                print(f"retrieval failed after retry for query: {query}")
-                return None
-
-            papers = response_data["data"]
-
-            if use_cache:
-                save_response_to_cache(
-                    query=query,
-                    max_paper_num=max_paper_num,
-                    min_citation_count=min_citation_count,
-                    sort=sort,
-                    fields=fields,
-                    papers=papers,
-                )
-
-            return papers
-
+        print("S2 status: 429 Too Many Requests")
+        print("S2 Retry-After:", response.headers.get("Retry-After"))
         print(
-            f"Retry failed with status code {retry_response.status_code}: "
-            f"{retry_response.text}"
+            "Semantic Scholar still rate-limited this query after retries. "
+            "Skipping this query without caching the failed response."
         )
         return None
 
     print(f"Request failed with status code {response.status_code}: {response.text}")
     return None
 
-
 def search_papers_for_question(
     question: str,
     max_queries: int = 4,
     max_paper_num_per_query: int = 10,
     model: str = "gpt-5.4-mini",
-    min_seconds_between_queries: float = 10.0,
+    min_seconds_between_queries: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
 ) -> dict[str, Any]:
     """
     Full literature-search step:
@@ -396,7 +497,6 @@ def search_papers_for_question(
         papers = search_paper_via_query(
             query,
             max_paper_num=max_paper_num_per_query,
-            min_seconds_between_requests=min_seconds_between_queries,
             use_cache=True,
         )
 
