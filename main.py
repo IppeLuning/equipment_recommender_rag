@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
+import pandas as pd 
 
 from equipment_recommender_rag import main_pipeline
 from equipment_recommender_rag.problem_decomposition.subproblem_generation import (
@@ -16,7 +16,7 @@ from equipment_recommender_rag.problem_decomposition.subproblem_generation impor
 )
 
 
-DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.jsonl")
+DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.json")
 
 RELEVANCE_SCORE = {
     "best_match": 3,
@@ -260,6 +260,9 @@ def run_decomposed_pipeline(
     use_metadata_fallback: bool = True,
     abstract_only: bool = False,
     save_subproblem_results: bool = False,
+    include_paper_retrieval_records: bool = False,
+    retrieval_verbose: bool = False,
+    print_debug_tables: bool = False,
 ) -> dict[str, Any]:
     """
     Root orchestration:
@@ -318,6 +321,9 @@ def run_decomposed_pipeline(
             use_abstract_fallback=use_metadata_fallback,
             abstract_only=abstract_only,
             save_results=save_subproblem_results,
+            include_paper_retrieval_records=include_paper_retrieval_records,
+            retrieval_verbose=retrieval_verbose,
+            print_debug_tables=print_debug_tables,
         )
 
         subproblem_results.append(
@@ -344,12 +350,25 @@ def run_decomposed_pipeline(
     }
 
 
-def save_jsonl_record(record: dict[str, Any], output_path: str | Path) -> Path:
+def save_json_records(records: list[dict[str, Any]], output_path: str | Path) -> Path:
+    """
+    Save all full run records to a readable JSON file by default.
+
+    If the output path ends with .jsonl, it will still write line-delimited JSON
+    for backwards compatibility. Otherwise it writes a pretty-printed JSON array,
+    which is easier to inspect manually.
+    """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    with output_path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    if output_path.suffix.lower() == ".jsonl":
+        with output_path.open("w", encoding="utf-8") as file:
+            for record in records:
+                file.write(json.dumps(record, ensure_ascii=False) + "\n")
+    else:
+        with output_path.open("w", encoding="utf-8") as file:
+            json.dump(records, file, indent=2, ensure_ascii=False)
+            file.write("\n")
 
     return output_path
 
@@ -616,7 +635,7 @@ def main() -> None:
         "--output_file",
         type=str,
         default=str(DEFAULT_OUTPUT_PATH),
-        help="JSONL output file for full records.",
+        help="JSON output file for full records. Use .jsonl only if you explicitly want JSONL.",
     )
     parser.add_argument(
         "--csv_output_file",
@@ -653,6 +672,24 @@ def main() -> None:
         "--save_subproblem_results",
         action="store_true",
         help="Let main_pipeline save each subproblem run separately as well.",
+    )
+    parser.add_argument(
+        "--include_paper_retrieval_records",
+        action="store_true",
+        help=(
+            "Include the full per-paper retrieval records in the JSON output. "
+            "By default only the compact paper_retrieval_summary is saved."
+        ),
+    )
+    parser.add_argument(
+        "--retrieval_verbose",
+        action="store_true",
+        help="Print one retrieval status line per paper. Off by default to keep output compact.",
+    )
+    parser.add_argument(
+        "--print_debug_tables",
+        action="store_true",
+        help="Print candidate chunk and reranked chunk debug tables. Off by default.",
     )
 
     args = parser.parse_args()
@@ -704,6 +741,9 @@ def main() -> None:
             use_metadata_fallback=not args.no_metadata_fallback,
             abstract_only=args.abstract_only,
             save_subproblem_results=args.save_subproblem_results,
+            include_paper_retrieval_records=args.include_paper_retrieval_records,
+            retrieval_verbose=args.retrieval_verbose,
+            print_debug_tables=args.print_debug_tables,
         )
 
         record["input_query_id"] = query_record.get("query_id")
@@ -712,11 +752,11 @@ def main() -> None:
         record["input_source_is_review_paper"] = query_record.get("source_is_review_paper")
         record["input_raw_benchmark_item"] = query_record.get("raw_benchmark_item", {})
 
-        saved_path = save_jsonl_record(record, args.output_file)
-        print(f"\nSaved decomposed pipeline record to: {saved_path}")
-
         full_records.append(record)
         flat_rows.extend(_record_to_flat_rows(record))
+
+        saved_path = save_json_records(full_records, args.output_file)
+        print(f"\nSaved JSON output to: {saved_path}")
 
     if args.csv_output_file:
         csv_path = Path(args.csv_output_file)

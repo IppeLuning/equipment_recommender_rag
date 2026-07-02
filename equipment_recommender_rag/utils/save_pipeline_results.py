@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_RESULTS_PATH = Path("data/processed/proposed_equipment_runs.jsonl")
+DEFAULT_RESULTS_PATH = Path("data/processed/proposed_equipment_runs.json")
 
 
 def equipment_to_saved_record(equipment: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +51,7 @@ def build_run_record(
         "num_candidate_papers": result.get("num_candidate_papers"),
         "num_candidate_chunks": result.get("num_candidate_chunks"),
         "pipeline_config": pipeline_config,
+        "paper_retrieval_summary": result.get("paper_retrieval_summary"),
         "proposed_equipment": proposed_equipment,
     }
 
@@ -61,10 +62,12 @@ def save_run_record(
     output_path: str | Path = DEFAULT_RESULTS_PATH,
 ) -> Path:
     """
-    Append one compact run record to a JSONL file.
+    Append one compact run record to a readable JSON file.
 
-    JSONL means one JSON object per line. This is convenient because each
-    pipeline run can be appended without loading or rewriting the whole file.
+    By default this writes a JSON array to proposed_equipment_runs.json. If the
+    output path ends with .jsonl, it writes line-delimited JSON for backwards
+    compatibility. The compact record includes paper_retrieval_summary, but not
+    the full per-paper retrieval records.
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -74,7 +77,29 @@ def save_run_record(
         pipeline_config=pipeline_config,
     )
 
-    with output_path.open("a", encoding="utf-8") as file:
-        file.write(json.dumps(run_record, ensure_ascii=False) + "\n")
+    if output_path.suffix.lower() == ".jsonl":
+        with output_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(run_record, ensure_ascii=False) + "\n")
+        return output_path
+
+    if output_path.exists():
+        try:
+            with output_path.open("r", encoding="utf-8") as file:
+                existing_records = json.load(file)
+        except json.JSONDecodeError:
+            existing_records = []
+    else:
+        existing_records = []
+
+    if isinstance(existing_records, dict):
+        existing_records = [existing_records]
+    elif not isinstance(existing_records, list):
+        existing_records = []
+
+    existing_records.append(run_record)
+
+    with output_path.open("w", encoding="utf-8") as file:
+        json.dump(existing_records, file, indent=2, ensure_ascii=False)
+        file.write("\n")
 
     return output_path

@@ -1,63 +1,55 @@
 [
-  {
-    "pdf_path": "data/interim/pdfs/Reductive_Elimination_From_Tetra-Alkyl_Cuprates__MenCu_CF3_4_n____n_0_4___Beyond_Simple_Oxidation_States.pdf",
-    "doi": "10.1002/anie.202409315",
+{
+    "pdf_path": "data/interim/pdfs/Reentrant_multiple-q_magnetic_order_and_a__spin_meta-cholesteric__phase_in_Sr3Fe2O7.pdf",
+    "doi": "10.1038/s41535-024-00698-4",
     "is_review_paper": false,
     "benchmark_items": [
       {
-        "query_id": "ion_trap_cid_esI",
-        "problem_description": "I need to reproduce the gas-phase fragmentation study of anionic cuprate complexes from solution and measure their collision-induced dissociation patterns. What physical instrument setup should I use?",
+        "query_id": "sr3fe2o7_neutron_diffraction_setup",
+        "problem_description": "I need to determine magnetic Bragg reflections and reciprocal-space maps for a single-crystal magnetic material after field cooling. What physical instrument/setup was used for the diffraction measurement?",
         "query_type": "specific",
-        "expected_answer_granularity": "mixed",
+        "expected_answer_granularity": "specific_equipment",
         "case_type": "paper_grounded_local_candidate",
-        "analysis_goal": "Identify the ionization plus trapping/fragmentation setup used for gas-phase CID analysis of anions.",
+        "analysis_goal": "Identify the neutron diffraction instrument used for single-crystal magnetic structure measurements.",
         "expected_causes": [
-          "negative-ion electrospray ionization to transfer anions into the gas phase",
-          "mass-selected collision-induced dissociation in an ion trap with He collisions"
+          "magnetic Bragg peaks require neutron diffraction",
+          "reciprocal-space mapping of a single crystal"
         ],
         "expected_equipment": {
           "must_have": [
-            "negative-ion mode electrospray ionization source",
-            "three-dimensional quadrupole ion trap"
+            "ZEBRA diffractometer"
           ],
           "best_match": [
-            "ESI source + quadrupole ion trap CID setup",
-            "negative-ion electrospray ionization into a quadrupole ion trap",
-            "negative-ion mode electrospray ionization source",
-            "three-dimensional quadrupole ion trap"
+            "single-crystal neutron diffractometer",
+            "neutron diffractometer",
+            "ZEBRA diffractometer"
           ],
           "acceptable_alternatives": [
-            "electrospray ionization source",
-            "quadrupole ion trap",
-            "ion trap mass spectrometer"
+            "ZEBRA",
+            "single-crystal neutron diffraction setup"
           ],
           "supporting_but_not_ideal": [
-            "triple quadrupole mass spectrometer",
-            "orbitrap mass spectrometer with CID"
+            "2D-detector neutron diffraction setup",
+            "vertical focusing neutron diffraction setup"
           ],
           "clearly_not_suitable": [
-            "MALDI source",
-            "ICP-MS",
-            "NMR spectrometer"
+            "triple-axis spectrometer",
+            "time-of-flight spectrometer",
+            "vibrating-sample magnetometer"
           ]
         },
         "synonyms": {
-          "negative-ion mode electrospray ionization source": [
-            "ESI",
-            "negative-ion mode ESI"
-          ],
-          "three-dimensional quadrupole ion trap": [
-            "quadrupole ion trap",
-            "ion trap"
+          "ZEBRA diffractometer": [
+            "ZEBRA"
           ]
         },
         "evidence_text": [
-          "transferred into a three-dimensional quadrupole ion trap via negative-ion mode electrospray ionization (ESI)",
-          "mass-selected, accelerated to higher kinetic energies, and allowed to collide with the He atoms present in the ion trap",
-          "A subsequent m/z scan identified the resulting fragment ions"
+          "Neutron diffraction was measured at the ZEBRA diffractometer at PSI",
+          "single-crystal diffraction (ZEBRA)",
+          "a 2D detector which allowed collecting data in three-dimensional reciprocal space"
         ],
         "source_paper_policy": {
-          "source_doi": "10.1002/anie.202409315",
+          "source_doi": "10.1038/s41535-024-00698-4",
           "evaluate_with_source_available": true,
           "evaluate_with_source_held_out": false,
           "preferred_primary_mode": "source_available"
