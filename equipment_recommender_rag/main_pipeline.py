@@ -54,6 +54,7 @@ def run(
         "chunk_sz": chunk_sz,
         "min_chunk_sz": min_chunk_sz,
         "use_metadata_fallback": use_metadata_fallback,
+        "abstract_only": abstract_only,
     }
 
     search_result = search_papers_for_question(
@@ -148,8 +149,12 @@ def run(
 
 if __name__ == "__main__":
     query = (
-        "I work at Polyvation. We are developing a new polymer, which is a variation on PEEK for medical grade purposes. The material turns out to be way softer than anticipated. Which researchers at the RUG could help me understand why our experimental material turns out so soft? Which equipment could be used for supportive analysis? I am mainly interestested in the techniques Calorimetry, Rheology, Spectroscopy and Microscopy."
+        "I'm developing a clear food-packaging film, but the barrier performance and haze are worse than expected. Why might this be happening, and what equipment could help measure whether the polymer structure and crystallization state are causing the problem?"
     )
+    
+    """ query = (
+        "I work at Polyvation. We are developing a new polymer, which is a variation on PEEK for medical grade purposes. The material turns out to be way softer than anticipated. Which researchers at the RUG could help me understand why our experimental material turns out so soft? Which equipment could be used for supportive analysis? I am mainly interestested in the techniques Calorimetry, Rheology, Spectroscopy and Microscopy."
+    ) """
 
     result = run(
         query=query,

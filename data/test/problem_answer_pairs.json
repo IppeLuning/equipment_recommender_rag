@@ -1,91 +1,70 @@
 [
   {
-    "pdf_path": "data/single_files/Prominent_radiative_contributions_from_multiply-excited_states_in_laser-produced_tin_plasma_for_nanolithography.pdf",
+    "pdf_path": "data/interim/pdfs/Reductive_Elimination_From_Tetra-Alkyl_Cuprates__MenCu_CF3_4_n____n_0_4___Beyond_Simple_Oxidation_States.pdf",
+    "doi": "10.1002/anie.202409315",
     "is_review_paper": false,
     "benchmark_items": [
       {
-        "query_id": "sn_euv_spectra_01",
-        "problem_description": "We need to measure the EUV emission spectrum from a laser-produced tin microdroplet plasma and compare it against calculated opacity spectra around 13.5 nm. What instrument should we use?",
-        "difficulty": "easy",
-        "case_type": "local_match",
-        "literature_ideal_equipment": [
-          "transmission grating spectrometer"
+        "query_id": "ion_trap_cid_esI",
+        "problem_description": "I need to reproduce the gas-phase fragmentation study of anionic cuprate complexes from solution and measure their collision-induced dissociation patterns. What physical instrument setup should I use?",
+        "query_type": "specific",
+        "expected_answer_granularity": "mixed",
+        "case_type": "paper_grounded_local_candidate",
+        "analysis_goal": "Identify the ionization plus trapping/fragmentation setup used for gas-phase CID analysis of anions.",
+        "expected_causes": [
+          "negative-ion electrospray ionization to transfer anions into the gas phase",
+          "mass-selected collision-induced dissociation in an ion trap with He collisions"
         ],
-        "best_match": [
-          "transmission grating spectrometer"
-        ],
-        "acceptable_alternatives": [
-          "wavelength-calibrated spectrometer",
-          "spectrometer"
-        ],
-        "supporting_but_not_ideal": [],
-        "not_available_locally": [],
-        "clearly_not_suitable": [
-          "Nd:YAG laser system"
-        ],
-        "rationale": "The paper explicitly states that the EUV spectrum was recorded with a transmission grating spectrometer / wavelength-calibrated spectrometer. A laser is needed for plasma generation, not for spectral measurement.",
+        "expected_equipment": {
+          "must_have": [
+            "negative-ion mode electrospray ionization source",
+            "three-dimensional quadrupole ion trap"
+          ],
+          "best_match": [
+            "ESI source + quadrupole ion trap CID setup",
+            "negative-ion electrospray ionization into a quadrupole ion trap",
+            "negative-ion mode electrospray ionization source",
+            "three-dimensional quadrupole ion trap"
+          ],
+          "acceptable_alternatives": [
+            "electrospray ionization source",
+            "quadrupole ion trap",
+            "ion trap mass spectrometer"
+          ],
+          "supporting_but_not_ideal": [
+            "triple quadrupole mass spectrometer",
+            "orbitrap mass spectrometer with CID"
+          ],
+          "clearly_not_suitable": [
+            "MALDI source",
+            "ICP-MS",
+            "NMR spectrometer"
+          ]
+        },
+        "synonyms": {
+          "negative-ion mode electrospray ionization source": [
+            "ESI",
+            "negative-ion mode ESI"
+          ],
+          "three-dimensional quadrupole ion trap": [
+            "quadrupole ion trap",
+            "ion trap"
+          ]
+        },
         "evidence_text": [
-          "A transmission grating spectrometer, set up under a −60° angle with respect to the laser light propagation direction, enables unraveling the EUV spectrum.",
-          "The emission in the EUV regime is recorded using a wavelength-calibrated spectrometer"
-        ]
-      },
-      {
-        "query_id": "sn_plasma_generation_02",
-        "problem_description": "We are trying to generate a tin microdroplet plasma for EUV lithography studies using a pulsed solid-state drive laser rather than a CO2 laser. Which laser system best matches the setup in this paper?",
-        "difficulty": "medium",
-        "case_type": "multiple_local_options",
-        "literature_ideal_equipment": [
-          "Nd:YAG laser system"
+          "transferred into a three-dimensional quadrupole ion trap via negative-ion mode electrospray ionization (ESI)",
+          "mass-selected, accelerated to higher kinetic energies, and allowed to collide with the He atoms present in the ion trap",
+          "A subsequent m/z scan identified the resulting fragment ions"
         ],
-        "best_match": [
-          "Nd:YAG laser system"
-        ],
-        "acceptable_alternatives": [
-          "high-energy Nd:YAG laser system",
-          "Nd:YAG laser"
-        ],
-        "supporting_but_not_ideal": [],
-        "not_available_locally": [],
-        "clearly_not_suitable": [
-          "transmission grating spectrometer"
-        ],
-        "rationale": "The paper uses a 15-ns Nd:YAG pulse to irradiate molten tin microdroplets and generate the EUV-emitting plasma. Several local variants of the same laser platform would be reasonable matches.",
-        "evidence_text": [
-          "The experimental spectra were obtained by irradiating a molten Sn microdroplet, 30 μm in diameter, with a 15-ns-long Nd:YAG laser pulse",
-          "Switching to 1-μm-wavelength Nd:YAG lasers, for example, would be beneficial"
-        ]
-      },
-      {
-        "query_id": "sn_radiation_transport_03",
-        "problem_description": "I want to model where most of the EUV emission is formed in a dense tin microdroplet plasma and relate the spectra to plasma density and temperature. What kind of simulation framework or code should I use?",
-        "difficulty": "hard",
-        "case_type": "literature_ideal_unavailable",
-        "literature_ideal_equipment": [
-          "RALEF-2D code"
-        ],
-        "best_match": [],
-        "acceptable_alternatives": [
-          "radiation-hydrodynamics simulation code",
-          "radiative transfer code"
-        ],
-        "supporting_but_not_ideal": [
-          "ATOMIC",
-          "CHEMEOS"
-        ],
-        "not_available_locally": [
-          "RALEF-2D code"
-        ],
-        "clearly_not_suitable": [
-          "transmission grating spectrometer",
-          "Nd:YAG laser system"
-        ],
-        "rationale": "The paper uses RALEF-2D for radiation-hydrodynamics simulations to determine temperature and density profiles and the EUV-emissive zone. In a local lab, an exact RALEF-2D setup is unlikely to be available, so more general radiation-hydrodynamics or radiative transfer codes are the practical alternatives.",
-        "evidence_text": [
-          "We have undertaken radiation hydrodynamic simulations using the RALEF-2D code",
-          "RALEF-2D is a two-dimensional numerical code which solves the 2D single-fluid, one-temperature hydrodynamics equations and the spectral radiation transfer equation"
-        ]
+        "source_paper_policy": {
+          "source_doi": "10.1002/anie.202409315",
+          "evaluate_with_source_available": true,
+          "evaluate_with_source_held_out": false,
+          "preferred_primary_mode": "source_available"
+        }
       }
     ],
-    "status": "benchmark_items_extracted"
+    "status": "benchmark_items_extracted",
+    "schema_version": "compact_v1"
   }
 ]

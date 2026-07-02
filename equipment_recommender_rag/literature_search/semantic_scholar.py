@@ -39,6 +39,7 @@ SEMANTIC_SCHOLAR_FIELDS = ",".join(
         "tldr",
         "openAccessPdf",
         "isOpenAccess",
+        "publicationTypes",
     ]
 )
 
@@ -87,6 +88,32 @@ def generate_search_queries(
 
     return queries
 
+def get_publication_types(paper: dict[str, Any]) -> list[str]:
+    """
+    Return Semantic Scholar publication types, for example:
+    ['Review'] or ['JournalArticle'].
+    """
+    publication_types = paper.get("publicationTypes") or []
+
+    if isinstance(publication_types, list):
+        return [
+            item.strip()
+            for item in publication_types
+            if isinstance(item, str) and item.strip()
+        ]
+
+    if isinstance(publication_types, str) and publication_types.strip():
+        return [publication_types.strip()]
+
+    return []
+
+
+def is_review_paper(paper: dict[str, Any]) -> bool:
+    """
+    Heuristic: mark as review if Semantic Scholar publicationTypes contains review.
+    """
+    publication_types = get_publication_types(paper)
+    return any("review" in item.lower() for item in publication_types)
 
 def _get_tldr_text(paper: dict[str, Any]) -> str | None:
     """
@@ -160,6 +187,7 @@ def paper_metadata_text(paper: dict[str, Any]) -> str | None:
     authors = paper.get("authors") or []
     venue_name = _get_publication_venue_name(paper)
     fields_of_study = _get_s2_fields_of_study(paper)
+    publication_types = get_publication_types(paper)
 
     author_names = [
         author.get("name")
@@ -177,6 +205,10 @@ def paper_metadata_text(paper: dict[str, Any]) -> str | None:
 
     if tldr_text:
         parts.append(f"TLDR: {tldr_text}")
+
+    if publication_types:
+        parts.append(f"Publication types: {', '.join(publication_types)}")
+        parts.append(f"Is review paper: {is_review_paper(paper)}")
 
     if year:
         parts.append(f"Year: {year}")
@@ -410,5 +442,7 @@ if __name__ == "__main__":
     print(f"\nRetrieved {len(output['papers'])} unique papers.")
     for paper in output["papers"][:5]:
         print("-", paper.get("title"), f"({paper.get('year')})")
+        print("  publication types:", get_publication_types(paper))
+        print("  is review paper:", is_review_paper(paper))
         print("  fallback source type:", paper_fallback_source_type(paper))
         print("  has metadata text:", bool(paper_metadata_text(paper)))
