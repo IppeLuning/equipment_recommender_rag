@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 
+@lru_cache(maxsize=2)
 def load_reranker(model_name: str = "BAAI/bge-reranker-v2-m3"):
     tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
     model = AutoModelForSequenceClassification.from_pretrained(model_name)

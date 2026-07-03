@@ -1,486 +1,109 @@
 from __future__ import annotations
 
-import argparse
-import hashlib
-import inspect
 import json
-import re
-import traceback
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd 
-
-from equipment_recommender_rag import main_pipeline
-from equipment_recommender_rag.problem_decomposition.subproblem_generation import (
-    generate_subproblems,
+from equipment_recommender_rag.equipment_inventory.extract_equipment_from_text import (
+    extract_equipment_from_reranked_chunks,
+)
+from equipment_recommender_rag.literature_search.retrieve_candidate_chunks import (
+    retrieve_candidate_chunks_from_papers,
+    summarize_paper_retrieval_records,
+)
+from equipment_recommender_rag.literature_search.semantic_scholar import (
+    search_papers_for_question,
+)
+from equipment_recommender_rag.reranking.rerank_chunks import (
+    rerank_top_k_chunks,
+)
+from equipment_recommender_rag.reranking.rerank_papers import (
+    DEFAULT_PAPER_RERANKER_MODEL,
+    rerank_papers_by_metadata,
+    summarize_paper_reranking_records,
+)
+from equipment_recommender_rag.utils.save_pipeline_results import (
+    DEFAULT_RESULTS_PATH,
+    save_run_record,
 )
 
 
-DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.json")
-
-
-COMPLETED_STATUS = "completed"
-FAILED_STATUS = "failed"
-INTERRUPTED_STATUS = "interrupted"
-
-
-def utc_now_iso() -> str:
+def print_paper_retrieval_summary(
+    paper_retrieval_summary: dict[str, Any],
+) -> None:
     """
-    Return an ISO timestamp in UTC for run bookkeeping.
+    Print only a compact source-availability overview.
+
+    This intentionally does not print one line per paper, because that becomes
+    too noisy for large runs. The detailed paper records can still be enabled
+    through include_paper_retrieval_records=True if you need them for debugging.
     """
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _is_missing_scalar(value: Any) -> bool:
-    """
-    Treat None and pandas/numpy missing scalar values as missing.
-    """
-    if value is None:
-        return True
-
-    try:
-        missing = pd.isna(value)
-    except (TypeError, ValueError):
-        return False
-
-    try:
-        return bool(missing)
-    except (TypeError, ValueError):
-        return False
-
-
-def _optional_text(value: Any) -> str | None:
-    """
-    Convert a scalar value to clean text, returning None for missing/empty values.
-    """
-    if _is_missing_scalar(value):
-        return None
-
-    text = str(value).strip()
-    return text or None
-
-
-def make_query_run_id(query_record: dict[str, Any]) -> str:
-    """
-    Create a stable ID for resume/checkpointing.
-
-    The ID deliberately combines query_id with source metadata and the query text.
-    This avoids accidentally skipping a benchmark item when two different papers
-    happen to use the same local query_id.
-    """
-    identity_payload = {
-        "query_id": _optional_text(query_record.get("query_id")),
-        "query": _optional_text(query_record.get("query")) or "",
-        "source_pdf_path": _optional_text(query_record.get("source_pdf_path")),
-        "source_doi": _optional_text(query_record.get("source_doi")),
-    }
-
-    identity_text = json.dumps(
-        identity_payload,
-        sort_keys=True,
-        ensure_ascii=False,
-        default=str,
+    print("\nPaper retrieval overview:")
+    print(
+        "  attempted:",
+        paper_retrieval_summary.get("num_papers_attempted"),
+        "| with chunks:",
+        paper_retrieval_summary.get("num_papers_with_chunks"),
+        "| skipped:",
+        paper_retrieval_summary.get("num_skipped"),
     )
-    digest = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:16]
-
-    query_id = _optional_text(query_record.get("query_id"))
-    if query_id:
-        return f"query_id:{query_id}:sha256:{digest}"
-
-    return f"sha256:{digest}"
-
-
-def add_input_metadata(record: dict[str, Any], query_record: dict[str, Any]) -> None:
-    """
-    Add the original benchmark/input fields to a result or failure record.
-    """
-    record["input_run_id"] = make_query_run_id(query_record)
-    record["input_query_id"] = query_record.get("query_id")
-    record["input_source_pdf_path"] = query_record.get("source_pdf_path")
-    record["input_source_doi"] = query_record.get("source_doi")
-    record["input_source_is_review_paper"] = query_record.get("source_is_review_paper")
-    record["input_raw_benchmark_item"] = query_record.get("raw_benchmark_item", {})
-
-
-def record_run_id(record: dict[str, Any]) -> str | None:
-    """
-    Recover a run ID from a current or older output record.
-    """
-    run_id = _optional_text(record.get("input_run_id"))
-    if run_id:
-        return run_id
-
-    original_query = _optional_text(record.get("original_query"))
-    if not original_query:
-        return None
-
-    query_record = {
-        "query": original_query,
-        "query_id": record.get("input_query_id"),
-        "source_pdf_path": record.get("input_source_pdf_path"),
-        "source_doi": record.get("input_source_doi"),
-    }
-    return make_query_run_id(query_record)
-
-
-def record_status(record: dict[str, Any]) -> str:
-    """
-    Return the status of a record, with backwards compatibility for old outputs.
-    """
-    status = _optional_text(record.get("run_status"))
-    if status:
-        return status
-
-    if record.get("error"):
-        return FAILED_STATUS
-
-    return COMPLETED_STATUS
-
-
-def remove_records_for_run_id(
-    records: list[dict[str, Any]],
-    run_id: str,
-) -> list[dict[str, Any]]:
-    """
-    Remove old records for the same input item.
-
-    This keeps checkpoint files clean when a previously failed/interrupted query
-    is retried and succeeds later. It also prevents stale failures from remaining
-    beside a newer completed result.
-    """
-    return [
-        record
-        for record in records
-        if record_run_id(record) != run_id
-    ]
-
-
-def rebuild_flat_rows_from_completed_records(
-    records: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Rebuild flattened CSV rows from completed records only.
-
-    This is safer than appending incrementally when records can be replaced.
-    """
-    rows: list[dict[str, Any]] = []
-
-    for record in records:
-        if record_status(record) == COMPLETED_STATUS:
-            rows.extend(_record_to_flat_rows(record))
-
-    return rows
-
-
-def load_existing_records(output_path: str | Path) -> list[dict[str, Any]]:
-    """
-    Load previous output records so the run can resume instead of starting over.
-    """
-    output_path = Path(output_path)
-
-    if not output_path.exists():
-        return []
-
-    if output_path.stat().st_size == 0:
-        return []
-
-    try:
-        if output_path.suffix.lower() == ".jsonl":
-            records: list[dict[str, Any]] = []
-            with output_path.open("r", encoding="utf-8") as file:
-                for line in file:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    data = json.loads(line)
-                    if isinstance(data, dict):
-                        records.append(data)
-            return records
-
-        with output_path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if isinstance(data, list):
-            return [record for record in data if isinstance(record, dict)]
-
-        if isinstance(data, dict):
-            return [data]
-
-    except (json.JSONDecodeError, OSError) as exc:
-        print(
-            f"Warning: could not load existing output file {output_path}: {exc}. "
-            "Starting with an empty in-memory record list."
-        )
-
-    return []
-
-
-def make_failure_record(
-    query_record: dict[str, Any],
-    exc: BaseException,
-    started_at_utc: str,
-    status: str = FAILED_STATUS,
-) -> dict[str, Any]:
-    """
-    Store enough information to inspect and optionally retry a failed query later.
-    """
-    failed_at_utc = utc_now_iso()
-    record: dict[str, Any] = {
-        "run_timestamp_utc": failed_at_utc,
-        "run_status": status,
-        "started_at_utc": started_at_utc,
-        "failed_at_utc": failed_at_utc,
-        "original_query": query_record.get("query"),
-        "decomposition": None,
-        "used_decomposition": None,
-        "num_subproblems_run": 0,
-        "subproblem_results": [],
-        "aggregated_equipment": [],
-        "error": {
-            "type": type(exc).__name__,
-            "message": str(exc),
-            "traceback": "".join(
-                traceback.format_exception(type(exc), exc, exc.__traceback__)
-            ),
-        },
-    }
-    add_input_metadata(record, query_record)
-    return record
-
-RELEVANCE_SCORE = {
-    "best_match": 3,
-    "acceptable_alternative": 2,
-    "supporting_but_not_ideal": 1,
-    "clearly_not_suitable": 0,
-}
-
-
-def normalize_equipment_name(name: str | None) -> str:
-    """
-    Normalize equipment names for simple duplicate merging.
-    """
-    if not name:
-        return ""
-
-    normalized = name.lower()
-    normalized = normalized.replace("-", " ")
-    normalized = normalized.replace("–", " ")
-    normalized = normalized.replace("—", " ")
-    normalized = normalized.replace("_", " ")
-    normalized = re.sub(r"[^a-z0-9µμ\s]", " ", normalized)
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return normalized
-
-
-def _deduplicate_strings(values: list[Any]) -> list[str]:
-    """
-    Deduplicate string-like values while preserving order.
-    """
-    seen: set[str] = set()
-    output: list[str] = []
-
-    for value in values:
-        if value is None:
-            continue
-
-        text = str(value).strip()
-        if not text:
-            continue
-
-        key = text.lower()
-        if key in seen:
-            continue
-
-        seen.add(key)
-        output.append(text)
-
-    return output
-
-
-def _deduplicate_papers(papers: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """
-    Deduplicate supporting papers by DOI if available, otherwise by title.
-    """
-    seen: set[str] = set()
-    output: list[dict[str, Any]] = []
-
-    for paper in papers:
-        doi = paper.get("doi")
-        title = paper.get("paper_title")
-        key = str(doi or title or "").lower().strip()
-
-        if not key or key in seen:
-            continue
-
-        seen.add(key)
-        output.append(
-            {
-                "paper_title": title,
-                "doi": doi,
-            }
-        )
-
-    return output
-
-
-def _equipment_relevance_score(equipment: dict[str, Any]) -> int:
-    label = equipment.get("relevance_label")
-    return RELEVANCE_SCORE.get(str(label), -1)
-
-
-def aggregate_equipment_across_subproblems(
-    subproblem_results: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """
-    Merge equipment recommendations from all subproblem pipeline runs.
-
-    Ranking priority:
-    1. highest relevance label
-    2. highest confidence score
-    3. number of supporting subproblems
-    4. number of supporting papers
-    """
-    grouped: dict[str, dict[str, Any]] = {}
-
-    for subproblem_result in subproblem_results:
-        subproblem_id = subproblem_result.get("subproblem_id")
-        subproblem_description = subproblem_result.get("subproblem_description")
-        result = subproblem_result.get("pipeline_result", {})
-
-        for equipment in result.get("query_relevant_equipment", []):
-            equipment_name = equipment.get("equipment_name")
-            normalized_name = normalize_equipment_name(equipment_name)
-
-            if not normalized_name:
-                continue
-
-            confidence = equipment.get("confidence_score")
-            try:
-                confidence_float = float(confidence) if confidence is not None else None
-            except (TypeError, ValueError):
-                confidence_float = None
-
-            relevance_label = equipment.get("relevance_label")
-            relevance_score = _equipment_relevance_score(equipment)
-
-            if normalized_name not in grouped:
-                grouped[normalized_name] = {
-                    "equipment_name": equipment_name,
-                    "normalized_equipment_name": normalized_name,
-                    "aliases": [],
-                    "equipment_type": equipment.get("equipment_type"),
-                    "best_relevance_label": relevance_label,
-                    "best_relevance_score": relevance_score,
-                    "max_confidence_score": confidence_float,
-                    "supporting_subproblem_ids": [],
-                    "supporting_subproblem_descriptions": [],
-                    "explanations": [],
-                    "query_specific_uses": [],
-                    "measurement_outputs": [],
-                    "evidence_text": [],
-                    "supporting_papers": [],
-                    "raw_mentions": [],
-                }
-
-            record = grouped[normalized_name]
-
-            # Keep the strongest label seen for this equipment.
-            if relevance_score > record["best_relevance_score"]:
-                record["best_relevance_score"] = relevance_score
-                record["best_relevance_label"] = relevance_label
-                record["equipment_name"] = equipment_name or record["equipment_name"]
-                record["equipment_type"] = equipment.get("equipment_type") or record["equipment_type"]
-
-            # Keep the highest confidence score seen.
-            if confidence_float is not None:
-                current_conf = record.get("max_confidence_score")
-                if current_conf is None or confidence_float > current_conf:
-                    record["max_confidence_score"] = confidence_float
-
-            record["aliases"].extend(equipment.get("aliases", []) or [])
-            record["measurement_outputs"].extend(equipment.get("measurement_outputs", []) or [])
-            record["evidence_text"].extend(equipment.get("evidence_text", []) or [])
-            record["supporting_papers"].extend(equipment.get("supporting_papers", []) or [])
-
-            reason = equipment.get("reason")
-            if reason:
-                record["explanations"].append(reason)
-
-            query_specific_use = equipment.get("query_specific_use")
-            if query_specific_use:
-                record["query_specific_uses"].append(query_specific_use)
-
-            if subproblem_id:
-                record["supporting_subproblem_ids"].append(subproblem_id)
-
-            if subproblem_description:
-                record["supporting_subproblem_descriptions"].append(subproblem_description)
-
-            record["raw_mentions"].append(
-                {
-                    "subproblem_id": subproblem_id,
-                    "equipment_name": equipment.get("equipment_name"),
-                    "relevance_label": relevance_label,
-                    "confidence_score": confidence_float,
-                    "reason": reason,
-                }
-            )
-
-    aggregated: list[dict[str, Any]] = []
-
-    for record in grouped.values():
-        record["aliases"] = _deduplicate_strings(record["aliases"])
-        record["measurement_outputs"] = _deduplicate_strings(record["measurement_outputs"])
-        record["evidence_text"] = _deduplicate_strings(record["evidence_text"])
-        record["explanations"] = _deduplicate_strings(record["explanations"])
-        record["query_specific_uses"] = _deduplicate_strings(record["query_specific_uses"])
-        record["supporting_subproblem_ids"] = _deduplicate_strings(
-            record["supporting_subproblem_ids"]
-        )
-        record["supporting_subproblem_descriptions"] = _deduplicate_strings(
-            record["supporting_subproblem_descriptions"]
-        )
-        record["supporting_papers"] = _deduplicate_papers(record["supporting_papers"])
-        record["num_supporting_subproblems"] = len(record["supporting_subproblem_ids"])
-        record["num_supporting_papers"] = len(record["supporting_papers"])
-        aggregated.append(record)
-
-    aggregated.sort(
-        key=lambda item: (
-            item.get("best_relevance_score", -1),
-            item.get("max_confidence_score") or 0.0,
-            item.get("num_supporting_subproblems", 0),
-            item.get("num_supporting_papers", 0),
-        ),
-        reverse=True,
+    print(
+        "  full text:",
+        paper_retrieval_summary.get("num_full_text_success"),
+        "| fallback:",
+        paper_retrieval_summary.get("num_fallback_used"),
+    )
+    print(
+        "  source types used:",
+        paper_retrieval_summary.get("used_source_type_counts", {}),
+    )
+    print(
+        "  full-text source types:",
+        paper_retrieval_summary.get("full_text_source_type_counts", {}),
+    )
+    print(
+        "  fallback source types:",
+        paper_retrieval_summary.get("fallback_source_type_counts", {}),
     )
 
-    return aggregated
 
-
-def _call_main_pipeline(query: str, **kwargs: Any) -> dict[str, Any]:
+def print_paper_reranking_summary(
+    paper_reranking_summary: dict[str, Any],
+) -> None:
     """
-    Call main_pipeline.run while only passing keyword arguments supported by the
-    current version of that function.
-
-    This makes the root main.py less fragile while you are still changing
-    main_pipeline.py during development.
+    Print a compact overview of the paper-level reranking step.
     """
-    signature = inspect.signature(main_pipeline.run)
-    supported_kwargs = {
-        key: value
-        for key, value in kwargs.items()
-        if key in signature.parameters
-    }
-    return main_pipeline.run(query=query, **supported_kwargs)
+    if not paper_reranking_summary.get("paper_reranking_enabled"):
+        print("\nPaper reranking disabled.")
+        return
+
+    print("\nPaper reranking overview:")
+    print(
+        "  scored:",
+        paper_reranking_summary.get("num_papers_scored"),
+        "| selected:",
+        paper_reranking_summary.get("num_papers_selected"),
+        "| skipped before reranking:",
+        paper_reranking_summary.get("num_papers_skipped_before_reranking"),
+    )
+    print(
+        "  selected text types:",
+        paper_reranking_summary.get("selected_reranking_text_type_counts", {}),
+    )
+
+    top_selected = paper_reranking_summary.get("top_selected_papers", [])
+    if top_selected:
+        print("  top selected papers:")
+        for paper in top_selected[:5]:
+            title = paper.get("title") or "Untitled"
+            year = paper.get("year") or "n.d."
+            score = paper.get("score")
+            score_text = f"{score:.4f}" if isinstance(score, float) else str(score)
+            print(f"    {paper.get('rank')}. {title} ({year}) | score={score_text}")
 
 
-def run_decomposed_pipeline(
+def run(
     query: str,
-    use_decomposition: bool = True,
-    max_subproblems: int = 5,
     max_queries: int = 4,
     max_paper_num_per_query: int = 8,
     max_papers: int = 8,
@@ -489,683 +112,218 @@ def run_decomposed_pipeline(
     chunk_sz: int = 250,
     min_chunk_sz: int = 80,
     use_metadata_fallback: bool = True,
+    save_results: bool = True,
     abstract_only: bool = False,
-    save_subproblem_results: bool = False,
+    results_output_path: str | Path = DEFAULT_RESULTS_PATH,
     include_paper_retrieval_records: bool = False,
     retrieval_verbose: bool = False,
     print_debug_tables: bool = False,
+    rerank_papers: bool = False,
+    include_paper_reranking_records: bool = False,
+    paper_reranker_model_name: str = DEFAULT_PAPER_RERANKER_MODEL,
+    paper_reranker_text_max_chars: int | None = 4000,
 ) -> dict[str, Any]:
     """
-    Root orchestration:
-    1. Optionally classify/decompose the original problem.
-    2. Run the existing main pipeline for each subproblem.
-    3. Aggregate the equipment recommendations across subproblems.
+    Main pipeline:
+    1. Search papers with Semantic Scholar.
+    2. Rerank all retrieved papers by title/abstract/TLDR/metadata.
+    3. Keep the top max_papers papers for full text or metadata fallback retrieval.
+    4. Retrieve top chunks per paper using embeddings.
+    5. Save paper-level retrieval records in the result.
+    6. Rerank chunks globally.
+    7. Extract query-relevant equipment.
+    8. Optionally save proposed equipment for the run.
     """
-    decomposition: dict[str, Any] | None = None
+    pipeline_config = {
+        "max_queries": max_queries,
+        "max_paper_num_per_query": max_paper_num_per_query,
+        "max_papers": max_papers,
+        "top_k_per_paper": top_k_per_paper,
+        "final_top_n_chunks": final_top_n_chunks,
+        "chunk_sz": chunk_sz,
+        "min_chunk_sz": min_chunk_sz,
+        "use_metadata_fallback": use_metadata_fallback,
+        "abstract_only": abstract_only,
+        "include_paper_retrieval_records": include_paper_retrieval_records,
+        "retrieval_verbose": retrieval_verbose,
+        "print_debug_tables": print_debug_tables,
+        "rerank_papers": rerank_papers,
+        "include_paper_reranking_records": include_paper_reranking_records,
+        "paper_reranker_model_name": paper_reranker_model_name,
+        "paper_reranker_text_max_chars": paper_reranker_text_max_chars,
+    }
 
-    if use_decomposition:
-        decomposition = generate_subproblems(
+    search_result = search_papers_for_question(
+        question=query,
+        max_queries=max_queries,
+        max_paper_num_per_query=max_paper_num_per_query,
+    )
+
+    print("\nGenerated Semantic Scholar queries:")
+    for q in search_result["generated_queries"]:
+        print("-", q)
+
+    all_candidate_papers = search_result["papers"]
+
+    if rerank_papers:
+        papers, paper_reranking_records = rerank_papers_by_metadata(
             query=query,
-            max_subproblems=max_subproblems,
+            papers=all_candidate_papers,
+            top_n=max_papers,
+            model_name=paper_reranker_model_name,
+            text_max_chars=paper_reranker_text_max_chars,
         )
-        should_decompose = bool(decomposition.get("should_decompose"))
-        subproblems = decomposition.get("subproblems", [])
+        paper_reranking_summary = summarize_paper_reranking_records(
+            paper_reranking_records
+        )
     else:
-        should_decompose = False
-        subproblems = []
+        papers = all_candidate_papers
+        paper_reranking_records = []
+        paper_reranking_summary = {
+            "paper_reranking_enabled": False,
+            "num_papers_scored": 0,
+            "num_papers_selected": min(len(papers), max_papers),
+            "num_papers_skipped_before_reranking": 0,
+            "top_selected_papers": [],
+        }
 
-    if not should_decompose or not subproblems:
-        subproblems_to_run = [
-            {
-                "subproblem_id": "original_query",
-                "subproblem_description": query,
-                "analysis_goal": "Answer the original query directly.",
-                "hypothesis_or_branch": "direct_query",
-                "expected_method_families": [],
-            }
-        ]
-    else:
-        subproblems_to_run = subproblems
+    print_paper_reranking_summary(paper_reranking_summary)
 
-    subproblem_results: list[dict[str, Any]] = []
+    candidate_chunks, paper_retrieval_records = retrieve_candidate_chunks_from_papers(
+        query=query,
+        papers=papers,
+        max_papers=max_papers,
+        top_k_per_paper=top_k_per_paper,
+        chunk_sz=chunk_sz,
+        min_chunk_sz=min_chunk_sz,
+        keep_last=True,
+        use_metadata_fallback=use_metadata_fallback,
+        abstract_only=abstract_only,
+        return_paper_retrieval_records=True,
+        verbose=retrieval_verbose,
+    )
 
-    for index, subproblem in enumerate(subproblems_to_run, start=1):
-        subproblem_id = subproblem.get("subproblem_id") or f"subproblem_{index}"
-        subproblem_query = subproblem.get("subproblem_description") or query
+    paper_retrieval_summary = summarize_paper_retrieval_records(
+        paper_retrieval_records
+    )
 
-        print("\n" + "=" * 80)
-        print(f"Running pipeline for subproblem {index}/{len(subproblems_to_run)}")
-        print("Subproblem ID:", subproblem_id)
-        print("Subproblem query:", subproblem_query)
-        print("=" * 80)
+    print_paper_retrieval_summary(
+        paper_retrieval_summary=paper_retrieval_summary,
+    )
 
-        pipeline_result = _call_main_pipeline(
-            query=subproblem_query,
-            max_queries=max_queries,
-            max_paper_num_per_query=max_paper_num_per_query,
-            max_papers=max_papers,
-            top_k_per_paper=top_k_per_paper,
-            final_top_n_chunks=final_top_n_chunks,
-            chunk_sz=chunk_sz,
-            min_chunk_sz=min_chunk_sz,
-            use_metadata_fallback=use_metadata_fallback,
-            use_abstract_fallback=use_metadata_fallback,
-            abstract_only=abstract_only,
-            save_results=save_subproblem_results,
-            include_paper_retrieval_records=include_paper_retrieval_records,
-            retrieval_verbose=retrieval_verbose,
-            print_debug_tables=print_debug_tables,
+    if candidate_chunks.empty:
+        result = {
+            "query": query,
+            "status": "no_candidate_chunks",
+            "generated_queries": search_result["generated_queries"],
+            "query_relevant_equipment": [],
+            "num_candidate_papers_before_paper_reranking": len(all_candidate_papers),
+            "num_candidate_papers": len(papers),
+            "num_candidate_chunks": 0,
+            "paper_reranking_summary": paper_reranking_summary,
+            "paper_retrieval_summary": paper_retrieval_summary,
+        }
+
+        if include_paper_reranking_records:
+            result["paper_reranking_records"] = paper_reranking_records
+
+        if include_paper_retrieval_records:
+            result["paper_retrieval_records"] = paper_retrieval_records
+
+        if save_results:
+            saved_path = save_run_record(
+                result=result,
+                pipeline_config=pipeline_config,
+                output_path=results_output_path,
+            )
+            result["saved_run_record_path"] = str(saved_path)
+            print(f"\nSaved run record to: {saved_path}")
+
+        return result
+
+    if print_debug_tables:
+        print("\nCombined embedding-retrieved chunks across papers:")
+        print(
+            candidate_chunks[
+                ["paper_title", "chunk_id", "similarity", "source_type"]
+            ].head(20).to_string(index=False)
         )
 
-        subproblem_results.append(
-            {
-                "subproblem_id": subproblem_id,
-                "subproblem_description": subproblem_query,
-                "analysis_goal": subproblem.get("analysis_goal"),
-                "hypothesis_or_branch": subproblem.get("hypothesis_or_branch"),
-                "expected_method_families": subproblem.get("expected_method_families", []),
-                "pipeline_result": pipeline_result,
-            }
+    reranked_chunks = rerank_top_k_chunks(
+        query=query,
+        retrieved_chunks_df=candidate_chunks,
+        text_column="chunk_text",
+    )
+
+    if print_debug_tables:
+        print("\nTop globally reranked chunks:")
+        print(
+            reranked_chunks[
+                ["paper_title", "chunk_id", "similarity", "reranker_score", "source_type"]
+            ].head(15).to_string(index=False)
         )
 
-    aggregated_equipment = aggregate_equipment_across_subproblems(subproblem_results)
+    extracted_result = extract_equipment_from_reranked_chunks(
+        query=query,
+        reranked_chunks_df=reranked_chunks,
+        source_label="main_pipeline_semantic_scholar_search",
+        top_n_chunks=final_top_n_chunks,
+        text_column="chunk_text",
+        model="gpt-5.4-mini",
+    )
 
-    return {
-        "run_timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "original_query": query,
-        "decomposition": decomposition,
-        "used_decomposition": bool(use_decomposition and should_decompose and subproblems),
-        "num_subproblems_run": len(subproblems_to_run),
-        "subproblem_results": subproblem_results,
-        "aggregated_equipment": aggregated_equipment,
-    }
+    extracted_result["generated_queries"] = search_result["generated_queries"]
+    extracted_result["num_candidate_papers_before_paper_reranking"] = len(all_candidate_papers)
+    extracted_result["num_candidate_papers"] = len(papers)
+    extracted_result["num_candidate_chunks"] = len(candidate_chunks)
+    extracted_result["paper_reranking_summary"] = paper_reranking_summary
+    extracted_result["paper_retrieval_summary"] = paper_retrieval_summary
 
+    if include_paper_reranking_records:
+        extracted_result["paper_reranking_records"] = paper_reranking_records
 
-def save_json_records(records: list[dict[str, Any]], output_path: str | Path) -> Path:
-    """
-    Save all full run records to a readable JSON file by default.
+    if include_paper_retrieval_records:
+        extracted_result["paper_retrieval_records"] = paper_retrieval_records
 
-    The file is written atomically via a temporary file and then replaced. This
-    reduces the chance of corrupting the existing checkpoint if the process is
-    interrupted while saving.
-    """
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = output_path.with_name(f".{output_path.name}.tmp")
-
-    if output_path.suffix.lower() == ".jsonl":
-        with tmp_path.open("w", encoding="utf-8") as file:
-            for record in records:
-                file.write(
-                    json.dumps(record, ensure_ascii=False, default=str) + "\n"
-                )
-    else:
-        with tmp_path.open("w", encoding="utf-8") as file:
-            json.dump(records, file, indent=2, ensure_ascii=False, default=str)
-            file.write("\n")
-
-    tmp_path.replace(output_path)
-    return output_path
-
-
-
-
-def _extract_problem_descriptions_from_json_object(
-    data: Any,
-) -> list[dict[str, Any]]:
-    """
-    Extract benchmark queries from a JSON object.
-
-    Supports:
-    1. Your benchmark format:
-       [
-         {
-           "pdf_path": "...",
-           "doi": "...",
-           "benchmark_items": [
-             {"query_id": "...", "problem_description": "..."}
-           ]
-         }
-       ]
-
-    2. A direct list of items:
-       [
-         {"query_id": "...", "problem_description": "..."}
-       ]
-
-    3. A single dict:
-       {"problem_description": "..."}
-    """
-    query_records: list[dict[str, Any]] = []
-
-    def add_query_record(
-        problem_description: Any,
-        query_id: Any = None,
-        source_pdf_path: Any = None,
-        source_doi: Any = None,
-        source_is_review_paper: Any = None,
-        raw_item: dict[str, Any] | None = None,
-    ) -> None:
-        if problem_description is None:
-            return
-
-        query = str(problem_description).strip()
-        if not query:
-            return
-
-        query_records.append(
-            {
-                "query": query,
-                "query_id": query_id,
-                "source_pdf_path": source_pdf_path,
-                "source_doi": source_doi,
-                "source_is_review_paper": source_is_review_paper,
-                "raw_benchmark_item": raw_item or {},
-            }
+    if save_results:
+        saved_path = save_run_record(
+            result=extracted_result,
+            pipeline_config=pipeline_config,
+            output_path=results_output_path,
         )
+        extracted_result["saved_run_record_path"] = str(saved_path)
+        print(f"\nSaved run record to: {saved_path}")
 
-    if isinstance(data, list):
-        for paper_or_item in data:
-            if not isinstance(paper_or_item, dict):
-                continue
-
-            # Your nested paper-level benchmark format.
-            benchmark_items = paper_or_item.get("benchmark_items")
-            if isinstance(benchmark_items, list):
-                for item in benchmark_items:
-                    if not isinstance(item, dict):
-                        continue
-
-                    add_query_record(
-                        problem_description=item.get("problem_description"),
-                        query_id=item.get("query_id"),
-                        source_pdf_path=paper_or_item.get("pdf_path"),
-                        source_doi=paper_or_item.get("doi"),
-                        source_is_review_paper=paper_or_item.get("is_review_paper"),
-                        raw_item=item,
-                    )
-
-            # Direct list of benchmark items.
-            elif "problem_description" in paper_or_item:
-                add_query_record(
-                    problem_description=paper_or_item.get("problem_description"),
-                    query_id=paper_or_item.get("query_id"),
-                    source_pdf_path=paper_or_item.get("pdf_path"),
-                    source_doi=paper_or_item.get("doi"),
-                    source_is_review_paper=paper_or_item.get("is_review_paper"),
-                    raw_item=paper_or_item,
-                )
-
-    elif isinstance(data, dict):
-        # Single benchmark item.
-        if "problem_description" in data:
-            add_query_record(
-                problem_description=data.get("problem_description"),
-                query_id=data.get("query_id"),
-                source_pdf_path=data.get("pdf_path"),
-                source_doi=data.get("doi"),
-                source_is_review_paper=data.get("is_review_paper"),
-                raw_item=data,
-            )
-
-        # Single paper-level record.
-        benchmark_items = data.get("benchmark_items")
-        if isinstance(benchmark_items, list):
-            for item in benchmark_items:
-                if not isinstance(item, dict):
-                    continue
-
-                add_query_record(
-                    problem_description=item.get("problem_description"),
-                    query_id=item.get("query_id"),
-                    source_pdf_path=data.get("pdf_path"),
-                    source_doi=data.get("doi"),
-                    source_is_review_paper=data.get("is_review_paper"),
-                    raw_item=item,
-                )
-
-    return query_records
-
-
-def load_query_records_from_input_file(input_file: str | Path) -> list[dict[str, Any]]:
-    """
-    Load input queries from CSV, JSON, or JSONL.
-
-    CSV requirements:
-    - Must contain a 'problem_description' column.
-    - Optional useful columns: query_id, pdf_path, doi, is_review_paper.
-
-    JSON support:
-    - Supports the nested problem_answer_pairs.json format produced by your benchmark generator.
-    """
-    input_path = Path(input_file)
-    suffix = input_path.suffix.lower()
-
-    if suffix == ".csv":
-        input_df = pd.read_csv(input_path)
-
-        if "problem_description" not in input_df.columns:
-            raise ValueError("Input CSV must contain a 'problem_description' column.")
-
-        records: list[dict[str, Any]] = []
-
-        for _, row in input_df.iterrows():
-            problem_description = row.get("problem_description")
-            if pd.isna(problem_description):
-                continue
-
-            records.append(
-                {
-                    "query": str(problem_description),
-                    "query_id": row.get("query_id") if "query_id" in row else None,
-                    "source_pdf_path": row.get("pdf_path") if "pdf_path" in row else None,
-                    "source_doi": row.get("doi") if "doi" in row else None,
-                    "source_is_review_paper": (
-                        row.get("is_review_paper")
-                        if "is_review_paper" in row
-                        else None
-                    ),
-                    "raw_benchmark_item": row.to_dict(),
-                }
-            )
-
-        return records
-
-    if suffix == ".json":
-        with input_path.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        records = _extract_problem_descriptions_from_json_object(data)
-
-        if not records:
-            raise ValueError(
-                "No problem descriptions found in JSON file. Expected either "
-                "'problem_description' fields or nested 'benchmark_items'."
-            )
-
-        return records
-
-    if suffix == ".jsonl":
-        records: list[dict[str, Any]] = []
-
-        with input_path.open("r", encoding="utf-8") as file:
-            for line in file:
-                line = line.strip()
-                if not line:
-                    continue
-
-                data = json.loads(line)
-                records.extend(_extract_problem_descriptions_from_json_object(data))
-
-        if not records:
-            raise ValueError(
-                "No problem descriptions found in JSONL file. Expected either "
-                "'problem_description' fields or nested 'benchmark_items'."
-            )
-
-        return records
-
-    raise ValueError(
-        f"Unsupported input file type: {suffix}. Use .csv, .json, or .jsonl."
-    )
-
-
-def _record_to_flat_rows(record: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    Flatten aggregated equipment recommendations into rows for CSV output.
-    """
-    rows: list[dict[str, Any]] = []
-
-    for rank, equipment in enumerate(record.get("aggregated_equipment", []), start=1):
-        rows.append(
-            {
-                "input_query_id": record.get("input_query_id"),
-                "input_source_pdf_path": record.get("input_source_pdf_path"),
-                "input_source_doi": record.get("input_source_doi"),
-                "input_source_is_review_paper": record.get("input_source_is_review_paper"),
-                "original_query": record.get("original_query"),
-                "used_decomposition": record.get("used_decomposition"),
-                "num_subproblems_run": record.get("num_subproblems_run"),
-                "rank": rank,
-                "equipment_name": equipment.get("equipment_name"),
-                "equipment_type": equipment.get("equipment_type"),
-                "best_relevance_label": equipment.get("best_relevance_label"),
-                "max_confidence_score": equipment.get("max_confidence_score"),
-                "num_supporting_subproblems": equipment.get("num_supporting_subproblems"),
-                "num_supporting_papers": equipment.get("num_supporting_papers"),
-                "supporting_subproblem_ids": " | ".join(
-                    equipment.get("supporting_subproblem_ids", [])
-                ),
-                "aliases": " | ".join(equipment.get("aliases", [])),
-                "measurement_outputs": " | ".join(
-                    equipment.get("measurement_outputs", [])
-                ),
-                "explanations": " | ".join(equipment.get("explanations", [])),
-                "supporting_papers": " | ".join(
-                    [
-                        f"{paper.get('paper_title')} ({paper.get('doi')})"
-                        for paper in equipment.get("supporting_papers", [])
-                    ]
-                ),
-            }
-        )
-
-    return rows
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Run the equipment recommender with optional subproblem decomposition."
-        )
-    )
-
-    parser.add_argument("--query", type=str, help="Single problem description to run.")
-    parser.add_argument(
-        "--input_file",
-        type=str,
-        help="Optional CSV, JSON, or JSONL file with problem descriptions.",
-    )
-    parser.add_argument(
-        "--output_file",
-        type=str,
-        default=str(DEFAULT_OUTPUT_PATH),
-        help="JSON output file for full records. Use .jsonl only if you explicitly want JSONL.",
-    )
-    parser.add_argument(
-        "--csv_output_file",
-        type=str,
-        default=None,
-        help="Optional CSV output with flattened aggregated equipment rows.",
-    )
-    parser.add_argument(
-        "--no_resume",
-        action="store_true",
-        help="Ignore existing output_file contents and start a fresh run.",
-    )
-    parser.add_argument(
-        "--skip_failed",
-        action="store_true",
-        help=(
-            "When resuming, skip records that previously failed or were interrupted. "
-            "By default, completed records are skipped and failed records are retried."
-        ),
-    )
-    parser.add_argument(
-        "--stop_on_error",
-        action="store_true",
-        help=(
-            "Stop the whole run after saving a failure record. By default, the script "
-            "logs the failure and continues with the next query."
-        ),
-    )
-
-    parser.add_argument("--max_subproblems", type=int, default=5)
-    parser.add_argument("--max_queries", type=int, default=4)
-    parser.add_argument("--max_paper_num_per_query", type=int, default=8)
-    parser.add_argument("--max_papers", type=int, default=8)
-    parser.add_argument("--top_k_per_paper", type=int, default=8)
-    parser.add_argument("--final_top_n_chunks", type=int, default=8)
-    parser.add_argument("--chunk_sz", type=int, default=250)
-    parser.add_argument("--min_chunk_sz", type=int, default=80)
-
-    parser.add_argument(
-        "--no_decomposition",
-        action="store_true",
-        help="Skip subproblem generation and run the original query directly.",
-    )
-    parser.add_argument(
-        "--no_metadata_fallback",
-        action="store_true",
-        help="Disable metadata fallback in the underlying pipeline where supported.",
-    )
-    parser.add_argument(
-        "--abstract_only",
-        action="store_true",
-        help="Use abstract/metadata evidence only in the underlying pipeline where supported.",
-    )
-    parser.add_argument(
-        "--save_subproblem_results",
-        action="store_true",
-        help="Let main_pipeline save each subproblem run separately as well.",
-    )
-    parser.add_argument(
-        "--include_paper_retrieval_records",
-        action="store_true",
-        help=(
-            "Include the full per-paper retrieval records in the JSON output. "
-            "By default only the compact paper_retrieval_summary is saved."
-        ),
-    )
-    parser.add_argument(
-        "--retrieval_verbose",
-        action="store_true",
-        help="Print one retrieval status line per paper. Off by default to keep output compact.",
-    )
-    parser.add_argument(
-        "--print_debug_tables",
-        action="store_true",
-        help="Print candidate chunk and reranked chunk debug tables. Off by default.",
-    )
-
-    args = parser.parse_args()
-
-    if not args.query and not args.input_file:
-        parser.error("Provide either --query or --input_file.")
-
-    query_records: list[dict[str, Any]] = []
-
-    if args.query:
-        query_records.append(
-            {
-                "query": args.query,
-                "query_id": None,
-                "source_pdf_path": None,
-                "source_doi": None,
-                "source_is_review_paper": None,
-                "raw_benchmark_item": {},
-            }
-        )
-
-    if args.input_file:
-        query_records.extend(load_query_records_from_input_file(args.input_file))
-
-    if args.no_resume:
-        full_records: list[dict[str, Any]] = []
-        print("Resume disabled: starting with an empty output record list.")
-    else:
-        full_records = load_existing_records(args.output_file)
-        if full_records:
-            completed_count = sum(
-                1 for record in full_records if record_status(record) == COMPLETED_STATUS
-            )
-            failed_count = sum(
-                1 for record in full_records if record_status(record) == FAILED_STATUS
-            )
-            interrupted_count = sum(
-                1 for record in full_records if record_status(record) == INTERRUPTED_STATUS
-            )
-            print(
-                f"Loaded {len(full_records)} existing output records from {args.output_file} "
-                f"({completed_count} completed, {failed_count} failed, "
-                f"{interrupted_count} interrupted)."
-            )
-
-    completed_run_ids = {
-        run_id
-        for record in full_records
-        if record_status(record) == COMPLETED_STATUS
-        for run_id in [record_run_id(record)]
-        if run_id
-    }
-    failed_or_interrupted_run_ids = {
-        run_id
-        for record in full_records
-        if record_status(record) in {FAILED_STATUS, INTERRUPTED_STATUS}
-        for run_id in [record_run_id(record)]
-        if run_id
-    }
-
-    flat_rows: list[dict[str, Any]] = []
-    for existing_record in full_records:
-        if record_status(existing_record) == COMPLETED_STATUS:
-            flat_rows.extend(_record_to_flat_rows(existing_record))
-
-    skipped_completed = 0
-    skipped_failed = 0
-
-    for query_index, query_record in enumerate(query_records, start=1):
-        query = query_record["query"]
-        run_id = make_query_run_id(query_record)
-
-        if run_id in completed_run_ids:
-            skipped_completed += 1
-            print("\n" + "-" * 100)
-            print(f"Skipping already completed query {query_index}/{len(query_records)}")
-            if query_record.get("query_id"):
-                print("Query ID:", query_record.get("query_id"))
-            if query_record.get("source_pdf_path"):
-                print("Source PDF:", query_record.get("source_pdf_path"))
-            print("Run ID:", run_id)
-            print("-" * 100)
-            continue
-
-        if args.skip_failed and run_id in failed_or_interrupted_run_ids:
-            skipped_failed += 1
-            print("\n" + "-" * 100)
-            print(f"Skipping previously failed/interrupted query {query_index}/{len(query_records)}")
-            if query_record.get("query_id"):
-                print("Query ID:", query_record.get("query_id"))
-            if query_record.get("source_pdf_path"):
-                print("Source PDF:", query_record.get("source_pdf_path"))
-            print("Run ID:", run_id)
-            print("-" * 100)
-            continue
-
-        print("\n" + "#" * 100)
-        print(f"Running original query {query_index}/{len(query_records)}")
-        if query_record.get("query_id"):
-            print("Query ID:", query_record.get("query_id"))
-        if query_record.get("source_pdf_path"):
-            print("Source PDF:", query_record.get("source_pdf_path"))
-        print("Run ID:", run_id)
-        print(query)
-        print("#" * 100)
-
-        started_at_utc = utc_now_iso()
-
-        try:
-            record = run_decomposed_pipeline(
-                query=query,
-                use_decomposition=not args.no_decomposition,
-                max_subproblems=args.max_subproblems,
-                max_queries=args.max_queries,
-                max_paper_num_per_query=args.max_paper_num_per_query,
-                max_papers=args.max_papers,
-                top_k_per_paper=args.top_k_per_paper,
-                final_top_n_chunks=args.final_top_n_chunks,
-                chunk_sz=args.chunk_sz,
-                min_chunk_sz=args.min_chunk_sz,
-                use_metadata_fallback=not args.no_metadata_fallback,
-                abstract_only=args.abstract_only,
-                save_subproblem_results=args.save_subproblem_results,
-                include_paper_retrieval_records=args.include_paper_retrieval_records,
-                retrieval_verbose=args.retrieval_verbose,
-                print_debug_tables=args.print_debug_tables,
-            )
-
-            record["run_status"] = COMPLETED_STATUS
-            record["started_at_utc"] = started_at_utc
-            record["completed_at_utc"] = utc_now_iso()
-            add_input_metadata(record, query_record)
-
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(record)
-
-            completed_run_ids.add(run_id)
-            failed_or_interrupted_run_ids.discard(run_id)
-
-            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
-
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nSaved checkpoint JSON output to: {saved_path}")
-
-        except KeyboardInterrupt as exc:
-            failure_record = make_failure_record(
-                query_record=query_record,
-                exc=exc,
-                started_at_utc=started_at_utc,
-                status=INTERRUPTED_STATUS,
-            )
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(failure_record)
-
-            completed_run_ids.discard(run_id)
-            failed_or_interrupted_run_ids.add(run_id)
-
-            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
-
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nInterrupted. Saved checkpoint JSON output to: {saved_path}")
-            raise
-
-        except Exception as exc:
-            failure_record = make_failure_record(
-                query_record=query_record,
-                exc=exc,
-                started_at_utc=started_at_utc,
-                status=FAILED_STATUS,
-            )
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(failure_record)
-
-            completed_run_ids.discard(run_id)
-            failed_or_interrupted_run_ids.add(run_id)
-
-            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
-
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nQuery failed but progress was saved to: {saved_path}")
-            print(f"Error type: {type(exc).__name__}")
-            print(f"Error message: {exc}")
-
-            if args.stop_on_error:
-                raise
-
-            print("Continuing with the next query...")
-
-    if args.csv_output_file:
-        csv_path = Path(args.csv_output_file)
-        csv_path.parent.mkdir(parents=True, exist_ok=True)
-        pd.DataFrame(flat_rows).to_csv(csv_path, index=False)
-        print(f"Saved flattened CSV output to: {csv_path}")
-
-    print("\nRun summary:")
-    print(f"  Completed records in output: {len(completed_run_ids)}")
-    print(f"  Failed/interrupted records in output: {len(failed_or_interrupted_run_ids)}")
-    print(f"  Skipped already completed this run: {skipped_completed}")
-    print(f"  Skipped failed/interrupted this run: {skipped_failed}")
-
-    if len(query_records) == 1:
-        requested_run_id = make_query_run_id(query_records[0])
-        matching_completed_records = [
-            record
-            for record in full_records
-            if record_status(record) == COMPLETED_STATUS
-            and record_run_id(record) == requested_run_id
-        ]
-
-        if matching_completed_records:
-            print("\nFinal aggregated equipment result:")
-            print(
-                json.dumps(
-                    matching_completed_records[-1]["aggregated_equipment"],
-                    indent=2,
-                    ensure_ascii=False,
-                    default=str,
-                )
-            )
+    return extracted_result
 
 
 if __name__ == "__main__":
-    main()
+    query = (
+        "I'm developing a clear food-packaging film, but the barrier performance "
+        "and haze are worse than expected. Why might this be happening, and what "
+        "equipment could help measure whether the polymer structure and "
+        "crystallization state are causing the problem?"
+    )
+
+    result = run(
+        query=query,
+        max_queries=4,
+        max_paper_num_per_query=15,
+        max_papers=80,
+        top_k_per_paper=2,
+        final_top_n_chunks=20,
+        chunk_sz=250,
+        min_chunk_sz=80,
+        use_metadata_fallback=True,
+        save_results=True,
+        abstract_only=True,
+        results_output_path=DEFAULT_RESULTS_PATH,
+        include_paper_retrieval_records=False,
+        retrieval_verbose=False,
+        print_debug_tables=False,
+        rerank_papers=True,
+        include_paper_reranking_records=False,
+    )
+
+    print("\nQuery-relevant equipment result:")
+    print(json.dumps(result, indent=2, ensure_ascii=False))

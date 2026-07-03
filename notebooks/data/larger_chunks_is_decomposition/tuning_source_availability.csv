@@ -1,0 +1,7 @@
+mode,query_type,n_queries,avg_papers_attempted,avg_full_text_success,avg_fallback_used,avg_pdf_used,avg_html_used,avg_abstract_fallback_used,avg_metadata_fallback_used,mean_full_text_fraction,mean_fallback_fraction
+decomposition,broad_diagnostic,5,8.0,2.2,5.8,1.8,0.0,3.4,2.0,0.275,0.725
+decomposition,method_selection,5,8.0,1.4,6.6,1.4,0.0,5.4,0.4,0.175,0.825
+decomposition,specific,5,8.0,2.8,5.2,2.0,0.0,4.0,0.8,0.35,0.65
+direct,broad_diagnostic,5,8.0,2.4,5.6,2.0,0.0,3.2,2.0,0.3,0.7
+direct,method_selection,5,8.0,2.2,5.8,2.2,0.0,5.2,0.2,0.275,0.725
+direct,specific,5,8.0,2.6,5.4,2.2,0.0,3.2,1.8,0.325,0.675

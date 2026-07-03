@@ -1,0 +1,7 @@
+mode,query_type,n_queries,avg_returned_equipment,strict_top1_accuracy,relaxed_top1_accuracy,strict_top3_accuracy,relaxed_top3_accuracy,strict_found_anywhere,relaxed_found_anywhere,mean_ndcg_at_3,mean_ndcg_at_5
+decomposition,broad_diagnostic,5,5.6,0.4,0.4,0.6,0.6,0.6,0.6,0.36648009099837453,0.29825195150248385
+decomposition,method_selection,5,3.0,0.6,0.6,0.6,0.6,0.6,0.6,0.28156723561365393,0.2034961231641697
+decomposition,specific,5,2.0,0.4,0.4,0.4,0.4,0.4,0.4,0.29818115665706885,0.2362741666075323
+direct,broad_diagnostic,5,2.4,0.6,0.6,0.8,0.8,0.8,0.8,0.45538735577272893,0.32912054286347164
+direct,method_selection,5,1.4,0.4,0.4,0.4,0.4,0.4,0.4,0.21628291898053117,0.15631341275644509
+direct,specific,5,1.4,0.2,0.4,0.2,0.4,0.2,0.4,0.2725106402309135,0.24276926405968138

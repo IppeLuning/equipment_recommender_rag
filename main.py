@@ -66,19 +66,17 @@ def make_query_run_id(query_record: dict[str, Any]) -> str:
     """
     Create a stable ID for resume/checkpointing.
 
-    If query_id exists, that is preferred. Otherwise a hash of the query and source
-    metadata is used. This makes reruns skip exactly the same benchmark item, even
-    when the input file is processed again from the beginning.
+    The ID deliberately combines query_id with source metadata and the query text.
+    This avoids accidentally skipping a benchmark item when two different papers
+    happen to use the same local query_id.
     """
-    query_id = _optional_text(query_record.get("query_id"))
-    if query_id:
-        return f"query_id:{query_id}"
-
     identity_payload = {
+        "query_id": _optional_text(query_record.get("query_id")),
         "query": _optional_text(query_record.get("query")) or "",
         "source_pdf_path": _optional_text(query_record.get("source_pdf_path")),
         "source_doi": _optional_text(query_record.get("source_doi")),
     }
+
     identity_text = json.dumps(
         identity_payload,
         sort_keys=True,
@@ -86,6 +84,11 @@ def make_query_run_id(query_record: dict[str, Any]) -> str:
         default=str,
     )
     digest = hashlib.sha256(identity_text.encode("utf-8")).hexdigest()[:16]
+
+    query_id = _optional_text(query_record.get("query_id"))
+    if query_id:
+        return f"query_id:{query_id}:sha256:{digest}"
+
     return f"sha256:{digest}"
 
 
@@ -134,6 +137,41 @@ def record_status(record: dict[str, Any]) -> str:
         return FAILED_STATUS
 
     return COMPLETED_STATUS
+
+
+def remove_records_for_run_id(
+    records: list[dict[str, Any]],
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """
+    Remove old records for the same input item.
+
+    This keeps checkpoint files clean when a previously failed/interrupted query
+    is retried and succeeds later. It also prevents stale failures from remaining
+    beside a newer completed result.
+    """
+    return [
+        record
+        for record in records
+        if record_run_id(record) != run_id
+    ]
+
+
+def rebuild_flat_rows_from_completed_records(
+    records: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """
+    Rebuild flattened CSV rows from completed records only.
+
+    This is safer than appending incrementally when records can be replaced.
+    """
+    rows: list[dict[str, Any]] = []
+
+    for record in records:
+        if record_status(record) == COMPLETED_STATUS:
+            rows.extend(_record_to_flat_rows(record))
+
+    return rows
 
 
 def load_existing_records(output_path: str | Path) -> list[dict[str, Any]]:
@@ -456,6 +494,7 @@ def run_decomposed_pipeline(
     include_paper_retrieval_records: bool = False,
     retrieval_verbose: bool = False,
     print_debug_tables: bool = False,
+    rerank_papers: bool = False,
 ) -> dict[str, Any]:
     """
     Root orchestration:
@@ -517,6 +556,7 @@ def run_decomposed_pipeline(
             include_paper_retrieval_records=include_paper_retrieval_records,
             retrieval_verbose=retrieval_verbose,
             print_debug_tables=print_debug_tables,
+            rerank_papers=rerank_papers,
         )
 
         subproblem_results.append(
@@ -910,6 +950,12 @@ def main() -> None:
         help="Print candidate chunk and reranked chunk debug tables. Off by default.",
     )
 
+    parser.add_argument(
+    "--no_paper_reranking",
+    action="store_true",
+    help="Disable paper-level reranking after Semantic Scholar search.",
+    )
+
     args = parser.parse_args()
 
     if not args.query and not args.input_file:
@@ -1018,6 +1064,7 @@ def main() -> None:
 
         try:
             record = run_decomposed_pipeline(
+                rerank_papers=not args.no_paper_reranking,
                 query=query,
                 use_decomposition=not args.no_decomposition,
                 max_subproblems=args.max_subproblems,
@@ -1041,9 +1088,13 @@ def main() -> None:
             record["completed_at_utc"] = utc_now_iso()
             add_input_metadata(record, query_record)
 
+            full_records = remove_records_for_run_id(full_records, run_id)
             full_records.append(record)
+
             completed_run_ids.add(run_id)
-            flat_rows.extend(_record_to_flat_rows(record))
+            failed_or_interrupted_run_ids.discard(run_id)
+
+            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
 
             saved_path = save_json_records(full_records, args.output_file)
             print(f"\nSaved checkpoint JSON output to: {saved_path}")
@@ -1055,8 +1106,14 @@ def main() -> None:
                 started_at_utc=started_at_utc,
                 status=INTERRUPTED_STATUS,
             )
+            full_records = remove_records_for_run_id(full_records, run_id)
             full_records.append(failure_record)
+
+            completed_run_ids.discard(run_id)
             failed_or_interrupted_run_ids.add(run_id)
+
+            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
+
             saved_path = save_json_records(full_records, args.output_file)
             print(f"\nInterrupted. Saved checkpoint JSON output to: {saved_path}")
             raise
@@ -1068,8 +1125,14 @@ def main() -> None:
                 started_at_utc=started_at_utc,
                 status=FAILED_STATUS,
             )
+            full_records = remove_records_for_run_id(full_records, run_id)
             full_records.append(failure_record)
+
+            completed_run_ids.discard(run_id)
             failed_or_interrupted_run_ids.add(run_id)
+
+            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
+
             saved_path = save_json_records(full_records, args.output_file)
             print(f"\nQuery failed but progress was saved to: {saved_path}")
             print(f"Error type: {type(exc).__name__}")
