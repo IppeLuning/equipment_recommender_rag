@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import argparse
+import threading
 import hashlib
 import inspect
 import json
 import re
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import pandas as pd 
+import pandas as pd
 
 from equipment_recommender_rag import main_pipeline
 from equipment_recommender_rag.problem_decomposition.subproblem_generation import (
@@ -18,7 +20,7 @@ from equipment_recommender_rag.problem_decomposition.subproblem_generation impor
 )
 
 
-DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.json")
+DEFAULT_OUTPUT_PATH = Path("data/processed/decomposed_pipeline_runs.jsonl")
 
 
 COMPLETED_STATUS = "completed"
@@ -872,7 +874,10 @@ def main() -> None:
         "--output_file",
         type=str,
         default=str(DEFAULT_OUTPUT_PATH),
-        help="JSON output file for full records. Use .jsonl only if you explicitly want JSONL.",
+        help=(
+            "Output file for full records. Defaults to JSONL, which is safer "
+            "for resumable multi-worker runs."
+        ),
     )
     parser.add_argument(
         "--csv_output_file",
@@ -899,6 +904,16 @@ def main() -> None:
         help=(
             "Stop the whole run after saving a failure record. By default, the script "
             "logs the failure and continues with the next query."
+        ),
+    )
+    parser.add_argument(
+        "--max_workers",
+        type=int,
+        default=1,
+        help=(
+            "Number of original benchmark queries to run in parallel. Start with 2 "
+            "on a MacBook Air. Semantic Scholar calls are still globally throttled "
+            "inside semantic_scholar.py."
         ),
     )
 
@@ -951,9 +966,9 @@ def main() -> None:
     )
 
     parser.add_argument(
-    "--no_paper_reranking",
-    action="store_true",
-    help="Disable paper-level reranking after Semantic Scholar search.",
+        "--no_paper_reranking",
+        action="store_true",
+        help="Disable paper-level reranking after Semantic Scholar search.",
     )
 
     args = parser.parse_args()
@@ -1021,9 +1036,9 @@ def main() -> None:
 
     skipped_completed = 0
     skipped_failed = 0
+    records_to_run: list[tuple[int, dict[str, Any], str]] = []
 
     for query_index, query_record in enumerate(query_records, start=1):
-        query = query_record["query"]
         run_id = make_query_run_id(query_record)
 
         if run_id in completed_run_ids:
@@ -1049,6 +1064,24 @@ def main() -> None:
             print("Run ID:", run_id)
             print("-" * 100)
             continue
+
+        records_to_run.append((query_index, query_record, run_id))
+
+    max_workers = max(1, args.max_workers)
+    if max_workers > 1 and len(records_to_run) > 1:
+        print(
+            f"\nRunning {len(records_to_run)} query records with max_workers={max_workers}. "
+            "Semantic Scholar requests are throttled globally in semantic_scholar.py."
+        )
+
+    output_lock = threading.Lock()
+
+    def execute_query_record(
+        query_index: int,
+        query_record: dict[str, Any],
+        run_id: str,
+    ) -> tuple[dict[str, Any], BaseException | None]:
+        query = query_record["query"]
 
         print("\n" + "#" * 100)
         print(f"Running original query {query_index}/{len(query_records)}")
@@ -1087,17 +1120,7 @@ def main() -> None:
             record["started_at_utc"] = started_at_utc
             record["completed_at_utc"] = utc_now_iso()
             add_input_metadata(record, query_record)
-
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(record)
-
-            completed_run_ids.add(run_id)
-            failed_or_interrupted_run_ids.discard(run_id)
-
-            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
-
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nSaved checkpoint JSON output to: {saved_path}")
+            return record, None
 
         except KeyboardInterrupt as exc:
             failure_record = make_failure_record(
@@ -1106,17 +1129,7 @@ def main() -> None:
                 started_at_utc=started_at_utc,
                 status=INTERRUPTED_STATUS,
             )
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(failure_record)
-
-            completed_run_ids.discard(run_id)
-            failed_or_interrupted_run_ids.add(run_id)
-
-            flat_rows = rebuild_flat_rows_from_completed_records(full_records)
-
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nInterrupted. Saved checkpoint JSON output to: {saved_path}")
-            raise
+            return failure_record, exc
 
         except Exception as exc:
             failure_record = make_failure_record(
@@ -1125,23 +1138,100 @@ def main() -> None:
                 started_at_utc=started_at_utc,
                 status=FAILED_STATUS,
             )
-            full_records = remove_records_for_run_id(full_records, run_id)
-            full_records.append(failure_record)
+            return failure_record, exc
 
-            completed_run_ids.discard(run_id)
-            failed_or_interrupted_run_ids.add(run_id)
+    def store_record(record: dict[str, Any], run_id: str) -> Path:
+        nonlocal full_records, flat_rows
+
+        with output_lock:
+            full_records = remove_records_for_run_id(full_records, run_id)
+            full_records.append(record)
+
+            if record_status(record) == COMPLETED_STATUS:
+                completed_run_ids.add(run_id)
+                failed_or_interrupted_run_ids.discard(run_id)
+            else:
+                completed_run_ids.discard(run_id)
+                failed_or_interrupted_run_ids.add(run_id)
 
             flat_rows = rebuild_flat_rows_from_completed_records(full_records)
+            return save_json_records(full_records, args.output_file)
 
-            saved_path = save_json_records(full_records, args.output_file)
-            print(f"\nQuery failed but progress was saved to: {saved_path}")
+    def report_saved_result(
+        record: dict[str, Any],
+        exc: BaseException | None,
+        saved_path: Path,
+    ) -> None:
+        status = record_status(record)
+
+        if status == COMPLETED_STATUS:
+            print(f"\nSaved checkpoint JSONL output to: {saved_path}")
+            return
+
+        if status == INTERRUPTED_STATUS:
+            print(f"\nInterrupted. Saved checkpoint JSONL output to: {saved_path}")
+            return
+
+        print(f"\nQuery failed but progress was saved to: {saved_path}")
+        if exc is not None:
             print(f"Error type: {type(exc).__name__}")
             print(f"Error message: {exc}")
+        print("Continuing with the next query...")
 
-            if args.stop_on_error:
-                raise
+    if max_workers == 1 or len(records_to_run) <= 1:
+        for query_index, query_record, run_id in records_to_run:
+            record, exc = execute_query_record(query_index, query_record, run_id)
+            saved_path = store_record(record, run_id)
+            report_saved_result(record, exc, saved_path)
 
-            print("Continuing with the next query...")
+            if record_status(record) == INTERRUPTED_STATUS and exc is not None:
+                raise exc
+
+            if args.stop_on_error and record_status(record) == FAILED_STATUS:
+                if exc is not None:
+                    raise exc
+                raise RuntimeError(f"Query failed: {run_id}")
+    else:
+        future_to_item = {}
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for item in records_to_run:
+                future = executor.submit(execute_query_record, *item)
+                future_to_item[future] = item
+
+            for future in as_completed(future_to_item):
+                query_index, query_record, run_id = future_to_item[future]
+
+                try:
+                    record, exc = future.result()
+                except BaseException as exc:
+                    # This should be rare because execute_query_record catches normal
+                    # failures, but keep it so every item still checkpoints.
+                    record = make_failure_record(
+                        query_record=query_record,
+                        exc=exc,
+                        started_at_utc=utc_now_iso(),
+                        status=(
+                            INTERRUPTED_STATUS
+                            if isinstance(exc, KeyboardInterrupt)
+                            else FAILED_STATUS
+                        ),
+                    )
+
+                saved_path = store_record(record, run_id)
+                report_saved_result(record, exc, saved_path)
+
+                if record_status(record) == INTERRUPTED_STATUS and exc is not None:
+                    for pending_future in future_to_item:
+                        pending_future.cancel()
+                    raise exc
+
+                if args.stop_on_error and record_status(record) == FAILED_STATUS:
+                    for pending_future in future_to_item:
+                        pending_future.cancel()
+                    if exc is not None:
+                        raise exc
+                    raise RuntimeError(f"Query failed: {run_id}")
 
     if args.csv_output_file:
         csv_path = Path(args.csv_output_file)

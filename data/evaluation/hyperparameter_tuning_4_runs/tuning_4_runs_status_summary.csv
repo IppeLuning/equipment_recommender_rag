@@ -1,0 +1,9 @@
+mode,run_status,n_records
+decomposition_no_rerank_12papers_2workers,completed,14
+decomposition_no_rerank_12papers_2workers,failed,1
+decomposition_rerank_10papers_2workers,completed,15
+direct_no_rerank_12papers,completed,15
+direct_rerank_10papers,completed,15
+direct_rerank_10papers_3workers,completed,14
+direct_rerank_10papers_3workers,failed,1
+test_problem_answer_output,completed,561

@@ -1,5 +1,6 @@
 import os
 import random
+import threading
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -24,11 +25,20 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 SEMANTIC_SCHOLAR_SEARCH_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 
 SEMANTIC_SCHOLAR_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-DEFAULT_S2_REQUEST_SPACING_SECONDS = 1.1
-DEFAULT_S2_INITIAL_BACKOFF_SECONDS = 1.0
-DEFAULT_S2_MAX_BACKOFF_SECONDS = 16.0
-DEFAULT_S2_MAX_RETRIES = 4
+DEFAULT_S2_REQUEST_SPACING_SECONDS = 1.2
+DEFAULT_S2_INITIAL_BACKOFF_SECONDS = 2.0
+DEFAULT_S2_MAX_BACKOFF_SECONDS = 120.0
+DEFAULT_S2_MAX_RETRIES = 8
 DEFAULT_S2_JITTER_SECONDS = 0.25
+
+
+# Shared process-wide throttle. This is important when main.py runs several
+# benchmark items in parallel: workers may run concurrently, but Semantic
+# Scholar requests still pass through this single lock, making the rate limit
+# roughly global for this Python process instead of per worker.
+_s2_rate_limit_lock = threading.Lock()
+_s2_cache_lock = threading.Lock()
+_last_s2_request_monotonic = 0.0
 
 
 # Keep this as a constant so the cache key is stable and easy to reuse.
@@ -255,6 +265,32 @@ def paper_fallback_source_type(paper: dict[str, Any]) -> str:
 
 
 
+def _wait_for_semantic_scholar_slot(
+    min_seconds_between_requests: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
+) -> None:
+    """
+    Enforce a process-wide minimum spacing between Semantic Scholar requests.
+
+    This protects against hitting the API rate limit when multiple worker
+    threads are active. Cached responses skip this function because they do not
+    call Semantic Scholar.
+    """
+    if min_seconds_between_requests <= 0:
+        return
+
+    global _last_s2_request_monotonic
+
+    with _s2_rate_limit_lock:
+        now = time.monotonic()
+        elapsed = now - _last_s2_request_monotonic
+        wait_seconds = min_seconds_between_requests - elapsed
+
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+
+        _last_s2_request_monotonic = time.monotonic()
+
+
 def _parse_retry_after_seconds(retry_after: str | None) -> float | None:
     """
     Parse a Retry-After header.
@@ -312,8 +348,14 @@ def _calculate_backoff_seconds(
     if retry_after_wait is not None:
         wait_time = max(wait_time, retry_after_wait)
 
+    # Add jitter so several workers do not wake up and retry at exactly the
+    # same moment. DEFAULT_S2_JITTER_SECONDS is kept for backwards-compatible
+    # naming, but it is treated as a fraction when <= 1.0.
     if jitter_seconds > 0:
-        wait_time += random.uniform(0, jitter_seconds)
+        if jitter_seconds <= 1.0:
+            wait_time += random.uniform(0, wait_time * jitter_seconds)
+        else:
+            wait_time += random.uniform(0, jitter_seconds)
 
     return min(wait_time, max_backoff_seconds)
 
@@ -327,6 +369,7 @@ def _get_with_exponential_backoff(
     initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
     max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
     jitter_seconds: float = DEFAULT_S2_JITTER_SECONDS,
+    min_seconds_between_requests: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
 ) -> requests.Response:
     """
     GET request with capped exponential backoff for temporary failures.
@@ -340,6 +383,8 @@ def _get_with_exponential_backoff(
     last_response: requests.Response | None = None
 
     for attempt in range(max_retries + 1):
+        _wait_for_semantic_scholar_slot(min_seconds_between_requests)
+
         response = requests.get(
             url,
             params=params,
@@ -383,6 +428,8 @@ def search_paper_via_query(
     max_retries: int = DEFAULT_S2_MAX_RETRIES,
     initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
     max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
+    jitter_seconds: float = DEFAULT_S2_JITTER_SECONDS,
+    min_seconds_between_requests: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
 ) -> list[dict[str, Any]] | None:
     """
     Search Semantic Scholar for papers using a single query string.
@@ -393,7 +440,7 @@ def search_paper_via_query(
 
     Retry behavior:
     - 429 and temporary 5xx errors use capped exponential backoff
-    - the maximum wait between retries is max_backoff_seconds, default 16s
+    - the maximum wait between retries is max_backoff_seconds, default 120s
     - successful responses are cached
     - failed/rate-limited responses are not cached
     """
@@ -405,13 +452,16 @@ def search_paper_via_query(
     fields = SEMANTIC_SCHOLAR_FIELDS
 
     if use_cache:
-        cached_papers = get_cached_response(
-            query=query,
-            max_paper_num=max_paper_num,
-            min_citation_count=min_citation_count,
-            sort=sort,
-            fields=fields,
-        )
+        # The cache is shared by all worker threads in this process. Keep reads
+        # behind a small lock to avoid SQLite/file-lock surprises.
+        with _s2_cache_lock:
+            cached_papers = get_cached_response(
+                query=query,
+                max_paper_num=max_paper_num,
+                min_citation_count=min_citation_count,
+                sort=sort,
+                fields=fields,
+            )
 
         if cached_papers is not None:
             print(f"Using cached Semantic Scholar response for query: {query}")
@@ -437,6 +487,8 @@ def search_paper_via_query(
         max_retries=max_retries,
         initial_backoff_seconds=initial_backoff_seconds,
         max_backoff_seconds=max_backoff_seconds,
+        jitter_seconds=jitter_seconds,
+        min_seconds_between_requests=min_seconds_between_requests,
     )
 
     if response.status_code == 200:
@@ -448,14 +500,16 @@ def search_paper_via_query(
         papers = response_data["data"]
 
         if use_cache:
-            save_response_to_cache(
-                query=query,
-                max_paper_num=max_paper_num,
-                min_citation_count=min_citation_count,
-                sort=sort,
-                fields=fields,
-                papers=papers,
-            )
+            # Serialize cache writes when several workers finish requests at once.
+            with _s2_cache_lock:
+                save_response_to_cache(
+                    query=query,
+                    max_paper_num=max_paper_num,
+                    min_citation_count=min_citation_count,
+                    sort=sort,
+                    fields=fields,
+                    papers=papers,
+                )
 
         return papers
 
@@ -476,7 +530,11 @@ def search_papers_for_question(
     max_queries: int = 4,
     max_paper_num_per_query: int = 10,
     model: str = "gpt-5.4-mini",
-    min_seconds_between_queries: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
+    min_seconds_between_queries: float = 0.0,
+    s2_max_retries: int = DEFAULT_S2_MAX_RETRIES,
+    s2_initial_backoff_seconds: float = DEFAULT_S2_INITIAL_BACKOFF_SECONDS,
+    s2_max_backoff_seconds: float = DEFAULT_S2_MAX_BACKOFF_SECONDS,
+    s2_min_seconds_between_requests: float = DEFAULT_S2_REQUEST_SPACING_SECONDS,
 ) -> dict[str, Any]:
     """
     Full literature-search step:
@@ -498,6 +556,10 @@ def search_papers_for_question(
             query,
             max_paper_num=max_paper_num_per_query,
             use_cache=True,
+            max_retries=s2_max_retries,
+            initial_backoff_seconds=s2_initial_backoff_seconds,
+            max_backoff_seconds=s2_max_backoff_seconds,
+            min_seconds_between_requests=s2_min_seconds_between_requests,
         )
 
         if not papers:

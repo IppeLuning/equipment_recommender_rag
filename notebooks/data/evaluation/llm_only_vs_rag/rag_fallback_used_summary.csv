@@ -1,0 +1,2 @@
+fallback_used,n_queries,mean_ndcg_at_3,median_ndcg_at_3,hit_rate_at_3,mean_fallback_fraction,query_percentage
+Fallback used,561,0.4138434085885137,0.4692787260227565,0.7771836007130125,0.7304812834224599,100.0

@@ -1,0 +1,5 @@
+run_name,path,raw_records,unique_records,completed_records,failed_or_interrupted_records
+direct_no_rerank_12papers,../data/processed/hyperparameter_tuning_15_results_no_paper_reranking_12papers.json,15,15,15,0
+direct_rerank_10papers,../data/processed/hyperparameter_tuning_15_results_paper_reranked_10papers.json,15,15,15,0
+decomposition_no_rerank_12papers_2workers,../data/processed/hyperparameter_tuning_15_results_decomposition_paper_no_reranked_12papers_2workers.json,15,15,15,0
+decomposition_rerank_10papers_2workers,../data/processed/hyperparameter_tuning_15_results_decomposition_paper_reranked_10papers_2workers.json,15,15,15,0
