@@ -75,7 +75,7 @@ Useful optional input columns or fields include:
 
 ## Common run used for evaluation
 
-An example configuration for running the system without decomposition is:
+The following command was used for the thesis results:
 
 ```bash
 uv run python -m main \
@@ -83,14 +83,13 @@ uv run python -m main \
   --output_file data/processed/test_problem_answer_output.jsonl \
   --csv_output_file data/processed/test_problem_answer_output.csv \
   --no_decomposition \
-  --max_workers 3 \
   --max_queries 4 \
   --max_paper_num_per_query 8 \
   --max_papers 10 \
   --top_k_per_paper 8 \
   --final_top_n_chunks 16 \
   --chunk_sz 250 \
-  --min_chunk_sz 80
+  --min_chunk_sz 80 \
 ```
 
 ## Important command-line options
@@ -111,6 +110,10 @@ uv run python -m main \
 | `--no_paper_reranking` | Disable paper-level reranking after Semantic Scholar retrieval. |
 | `--retrieval_verbose` | Print detailed paper retrieval logs. |
 | `--print_debug_tables` | Print debugging tables for candidate and reranked chunks. |
+
+## Notebooks
+
+The files in the notebook folder was used to evaluate the model's behaviour and make the results for the inventory evaluation.
 
 ## Output and resume behavior
 
